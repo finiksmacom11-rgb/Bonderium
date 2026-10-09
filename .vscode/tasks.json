@@ -1,0 +1,43 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: Configure",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}",
+                "-B",
+                "${workspaceFolder}/build",
+                "-G",
+                "MinGW Makefiles"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: Build",
+            "type": "process",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--config",
+                "Debug"
+            ],
+            "dependsOn": "CMake: Configure",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "CMake: Run",
+            "type": "process",
+            "command": "${workspaceFolder}/build/Bonderium.exe",
+            "dependsOn": "CMake: Build",
+            "problemMatcher": []
+        }
+    ]
+}
