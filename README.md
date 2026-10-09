@@ -1,20 +1,45 @@
 # Bonderium
 
-## C++ development on Windows
+## Разработка на C++ в Windows
 
-This project uses C++20, the native Windows API, and CMake. Install VS Code with
-the recommended Microsoft C/C++ and CMake Tools extensions, plus Python 3,
-CMake, and an LLVM-MinGW toolchain (`clang++`/`g++` and `mingw32-make`). Make
-sure Python, CMake, and the toolchain's `bin` directory are available on `PATH`.
+Проект использует C++20, Windows API и CMake. Для разработки установите:
 
-From a terminal in the project folder, run `python run.py` to configure, build,
-and launch the blank `bonderium` window.
+- VS Code с расширениями Microsoft C/C++ и CMake Tools;
+- Python 3;
+- CMake;
+- компилятор LLVM-MinGW (`clang++` или `g++`) и `mingw32-make`.
 
-In VS Code:
+Добавьте Python, CMake и папку `bin` LLVM-MinGW в переменную `PATH`.
 
-- Press `Ctrl+Shift+B` to configure and build the Debug executable.
-- Run **Tasks: Run Task** and choose **CMake: Run** to build and launch the
-  blank `bonderium` window.
+## Запуск
 
-The window implementation is in `src/main.cpp`. CMake places generated files
-in `build/`, which is not source code and should not be committed.
+Откройте папку проекта в VS Code или терминале.
+
+Чтобы собрать проект и сразу запустить пустое окно `bonderium`, выполните:
+
+```powershell
+python run.py
+```
+
+Чтобы собрать приложение и создать ярлык **bonderium** на рабочем столе,
+выполните:
+
+```powershell
+python create_shortcut.py
+```
+
+После этого запускайте приложение с рабочего стола через созданный ярлык.
+Если вы переместили папку проекта, повторно выполните команду, чтобы обновить
+путь в ярлыке:
+
+```powershell
+python create_shortcut.py
+```
+
+## Запуск из VS Code
+
+- Нажмите `Ctrl+Shift+B`, чтобы настроить и собрать приложение.
+- Для сборки и запуска выберите **Tasks: Run Task → CMake: Run**.
+
+Исходный код окна находится в `src/main.cpp`. CMake создаёт файлы сборки в
+папке `build/`; её содержимое не нужно добавлять в Git.

@@ -8,7 +8,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 BUILD_DIR = PROJECT_DIR / "build"
 
 
-def main():
+def build_project():
     if sys.platform != "win32":
         raise SystemExit("Bonderium currently runs on Windows only.")
     if shutil.which("cmake") is None:
@@ -22,7 +22,12 @@ def main():
         ["cmake", "--build", str(BUILD_DIR), "--config", "Debug"],
         check=True,
     )
-    subprocess.run([str(BUILD_DIR / "Bonderium.exe")], cwd=PROJECT_DIR, check=True)
+    return BUILD_DIR / "Bonderium.exe"
+
+
+def main():
+    executable = build_project()
+    subprocess.run([str(executable)], cwd=PROJECT_DIR, check=True)
 
 
 if __name__ == "__main__":
