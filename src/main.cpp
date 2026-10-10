@@ -15,8 +15,9 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         HDC device_context = BeginPaint(window, &paint);
         RECT client_area{};
         GetClientRect(window, &client_area);
-        DrawTextW(device_context, L"\u041F\u0440\u0438\u0432\u0435\u0442!", -1, &client_area,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(device_context,
+            L"\u041A\u0438\u0440\u0438\u043B\u043B, \u0434\u0443\u0448\u043A\u0430!",
+            -1, &client_area, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         EndPaint(window, &paint);
         return 0;
     }
