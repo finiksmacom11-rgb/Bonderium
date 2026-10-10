@@ -1,0 +1,41 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".Substring(1)
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Release tag must use vX.Y.Z format." }
+          cmake -S . -B build -A x64 "-DBONDERIUM_VERSION=$version" -DBONDERIUM_ENABLE_UPDATES=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package application
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "Bonderium-package"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item build/Release/Bonderium.exe $package
+          Copy-Item install.bat, install.ps1, updater.ps1, README.md $package
+          Compress-Archive -Path "$package/*" -DestinationPath Bonderium-windows-x64.zip
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: Bonderium-windows-x64.zip

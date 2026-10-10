@@ -1,5 +1,7 @@
 #include <windows.h>
 
+#include "updater.h"
+
 namespace
 {
 constexpr char window_class_name[] = "BonderiumWindow";
@@ -64,6 +66,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command)
 
     ShowWindow(window, show_command);
     UpdateWindow(window);
+    check_for_updates(window);
 
     MSG message{};
     int result = 0;
