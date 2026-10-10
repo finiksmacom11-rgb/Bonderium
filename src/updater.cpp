@@ -29,9 +29,6 @@ constexpr wchar_t release_path[] = L"/repos/finiksmacom11-rgb/Bonderium/releases
 constexpr wchar_t download_host[] = L"github.com";
 constexpr wchar_t download_path[] =
     L"/finiksmacom11-rgb/Bonderium/releases/latest/download/Bonderium-windows-x64.zip";
-constexpr wchar_t update_registry_key[] = L"Software\\Bonderium";
-constexpr wchar_t update_registry_value[] = L"LastUpdateCheck";
-constexpr unsigned long long update_interval = 24ULL * 60ULL * 60ULL * 10000000ULL;
 constexpr std::size_t maximum_download_size = 100U * 1024U * 1024U;
 
 class InternetHandle
@@ -171,7 +168,7 @@ bool get_https(const wchar_t* host, const wchar_t* path, std::string& response)
     {
         return false;
     }
-    WinHttpSetTimeouts(session.get(), 2500, 2500, 5000, 5000);
+    WinHttpSetTimeouts(session.get(), 1500, 2000, 3000, 3000);
 
     InternetHandle connection(
         WinHttpConnect(session.get(), host, INTERNET_DEFAULT_HTTPS_PORT, 0));
@@ -233,44 +230,6 @@ bool get_latest_release(std::string& version)
     version.assign(response, value_start + 1, value_end - value_start - 1);
     std::array<unsigned long long, 3> ignored{};
     return parse_version(version, ignored);
-}
-
-bool has_checked_recently()
-{
-    unsigned long long previous_check = 0;
-    DWORD value_size = sizeof(previous_check);
-    const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, update_registry_key,
-        update_registry_value, RRF_RT_REG_QWORD, nullptr, &previous_check, &value_size);
-    if (status != ERROR_SUCCESS)
-    {
-        return false;
-    }
-
-    FILETIME current_time{};
-    GetSystemTimeAsFileTime(&current_time);
-    ULARGE_INTEGER now{};
-    now.LowPart = current_time.dwLowDateTime;
-    now.HighPart = current_time.dwHighDateTime;
-    return now.QuadPart >= previous_check &&
-        now.QuadPart - previous_check < update_interval;
-}
-
-void remember_check()
-{
-    FILETIME current_time{};
-    GetSystemTimeAsFileTime(&current_time);
-    ULARGE_INTEGER now{};
-    now.LowPart = current_time.dwLowDateTime;
-    now.HighPart = current_time.dwHighDateTime;
-
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, update_registry_key, 0, nullptr, 0,
-            KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(key, update_registry_value, 0, REG_QWORD,
-            reinterpret_cast<const BYTE*>(&now.QuadPart), sizeof(now.QuadPart));
-        RegCloseKey(key);
-    }
 }
 
 std::wstring executable_path()
@@ -376,17 +335,11 @@ void show_update_error(HWND owner)
 
 void check_updates(HWND owner)
 {
-    if (has_checked_recently())
-    {
-        return;
-    }
-
     std::string latest_version;
     if (!get_latest_release(latest_version))
     {
         return;
     }
-    remember_check();
 
     if (!IsWindow(owner) || !is_newer_version(latest_version))
     {
