@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cwchar>
+#include <vector>
 
 namespace
 {
@@ -14,6 +16,10 @@ constexpr int toolbar_height = 62;
 constexpr int footer_height = 38;
 constexpr UINT_PTR camera_timer_id = 1;
 constexpr UINT camera_timer_interval_ms = 16;
+constexpr int molecule_tool_left = 258;
+constexpr int molecule_tool_width = 148;
+constexpr int molecule_tool_top = 14;
+constexpr int molecule_tool_height = 34;
 constexpr int baseline_cell_size = 42;
 constexpr int major_grid_interval = 5;
 constexpr double minimum_zoom = 0.18;
@@ -33,6 +39,8 @@ constexpr COLORREF primary_text_color = RGB(228, 236, 247);
 constexpr COLORREF muted_text_color = RGB(128, 144, 164);
 constexpr COLORREF x_axis_color = RGB(69, 214, 201);
 constexpr COLORREF y_axis_color = RGB(160, 132, 255);
+constexpr COLORREF molecule_color = RGB(69, 214, 201);
+constexpr COLORREF molecule_fill_color = RGB(22, 53, 64);
 
 struct ViewState
 {
@@ -44,7 +52,20 @@ struct ViewState
     ULONGLONG last_motion_tick = 0;
 };
 
+struct Molecule
+{
+    std::uint64_t id;
+    double x;
+    double y;
+    double radius;
+};
+
 ViewState view_state;
+std::vector<Molecule> molecules;
+std::uint64_t next_molecule_id = 1;
+bool molecule_tool_active = false;
+bool pointer_over_scene = false;
+POINT pointer_position{};
 
 int scene_width(const RECT& client_area)
 {
@@ -108,6 +129,115 @@ int world_to_screen_x(double world_x, int center_x, double cell_size)
 int world_to_screen_y(double world_y, int center_y, double cell_size)
 {
     return rounded_pixel(center_y - (world_y - view_state.center_y) * cell_size);
+}
+
+RECT molecule_tool_area(const RECT& client_area)
+{
+    return RECT{
+        client_area.left + molecule_tool_left,
+        client_area.top + molecule_tool_top,
+        client_area.left + molecule_tool_left + molecule_tool_width,
+        client_area.top + molecule_tool_top + molecule_tool_height};
+}
+
+void draw_molecule(HDC device_context, int center_x, int center_y, int radius,
+    std::uint64_t id, HFONT label_font)
+{
+    HPEN halo_pen = CreatePen(PS_SOLID, 1, RGB(34, 91, 101));
+    HBRUSH hollow_brush = static_cast<HBRUSH>(GetStockObject(HOLLOW_BRUSH));
+    HPEN previous_pen = static_cast<HPEN>(SelectObject(device_context, halo_pen));
+    HBRUSH previous_brush = static_cast<HBRUSH>(SelectObject(device_context, hollow_brush));
+    Ellipse(device_context, center_x - radius - 5, center_y - radius - 5,
+        center_x + radius + 6, center_y + radius + 6);
+    SelectObject(device_context, previous_brush);
+    SelectObject(device_context, previous_pen);
+    DeleteObject(halo_pen);
+
+    HPEN outline_pen = CreatePen(PS_SOLID, 2, molecule_color);
+    HBRUSH fill_brush = CreateSolidBrush(molecule_fill_color);
+    previous_pen = static_cast<HPEN>(SelectObject(device_context, outline_pen));
+    previous_brush = static_cast<HBRUSH>(SelectObject(device_context, fill_brush));
+    Ellipse(device_context, center_x - radius, center_y - radius,
+        center_x + radius + 1, center_y + radius + 1);
+    SelectObject(device_context, previous_brush);
+    SelectObject(device_context, previous_pen);
+    DeleteObject(fill_brush);
+    DeleteObject(outline_pen);
+
+    const int highlight_radius = (std::max)(2, radius / 5);
+    HBRUSH highlight_brush = CreateSolidBrush(RGB(143, 246, 229));
+    previous_brush = static_cast<HBRUSH>(SelectObject(device_context, highlight_brush));
+    Ellipse(device_context, center_x - highlight_radius, center_y - highlight_radius,
+        center_x + highlight_radius + 1, center_y + highlight_radius + 1);
+    SelectObject(device_context, previous_brush);
+    DeleteObject(highlight_brush);
+
+    if (radius >= 13)
+    {
+        wchar_t label[24]{};
+        std::swprintf(label, sizeof(label) / sizeof(label[0]), L"M%llu",
+            static_cast<unsigned long long>(id));
+        RECT label_area{center_x - radius, center_y + radius + 6,
+            center_x + radius + 1, center_y + radius + 23};
+        draw_text(device_context, label, label_area, primary_text_color,
+            label_font, DT_CENTER);
+    }
+}
+
+void draw_molecules(HDC device_context, const RECT& area, int center_x,
+    int center_y, double cell_size, HFONT label_font)
+{
+    const int saved_state = SaveDC(device_context);
+    IntersectClipRect(device_context, area.left, area.top, area.right, area.bottom);
+    for (const Molecule& molecule : molecules)
+    {
+        const double offset_x = (molecule.x - view_state.center_x) * cell_size;
+        const double offset_y = -(molecule.y - view_state.center_y) * cell_size;
+        const double radius = molecule.radius * cell_size;
+        if (std::abs(offset_x) > (area.right - area.left) / 2.0 + radius + 8.0 ||
+            std::abs(offset_y) > (area.bottom - area.top) / 2.0 + radius + 28.0)
+        {
+            continue;
+        }
+
+        const int screen_x = rounded_pixel(center_x + offset_x);
+        const int screen_y = rounded_pixel(center_y + offset_y);
+        draw_molecule(device_context, screen_x, screen_y,
+            (std::max)(2, rounded_pixel(radius)), molecule.id, label_font);
+    }
+
+    if (molecule_tool_active && pointer_over_scene)
+    {
+        if (pointer_position.x >= area.left && pointer_position.x < area.right &&
+            pointer_position.y >= area.top && pointer_position.y < area.bottom)
+        {
+            const double radius = 0.42 * cell_size;
+            const int screen_radius = (std::max)(2, rounded_pixel(radius));
+            HPEN preview_pen = CreatePen(PS_DASH, 1, molecule_color);
+            HBRUSH hollow_brush =
+                static_cast<HBRUSH>(GetStockObject(HOLLOW_BRUSH));
+            HPEN previous_pen =
+                static_cast<HPEN>(SelectObject(device_context, preview_pen));
+            HBRUSH previous_brush =
+                static_cast<HBRUSH>(SelectObject(device_context, hollow_brush));
+            Ellipse(device_context,
+                pointer_position.x - screen_radius,
+                pointer_position.y - screen_radius,
+                pointer_position.x + screen_radius + 1,
+                pointer_position.y + screen_radius + 1);
+            SelectObject(device_context, previous_brush);
+            SelectObject(device_context, previous_pen);
+            DeleteObject(preview_pen);
+
+            draw_line(device_context, pointer_position.x - 4,
+                pointer_position.y, pointer_position.x + 5,
+                pointer_position.y, molecule_color);
+            draw_line(device_context, pointer_position.x,
+                pointer_position.y - 4, pointer_position.x,
+                pointer_position.y + 5, molecule_color);
+        }
+    }
+    RestoreDC(device_context, saved_state);
 }
 
 void draw_grid(HDC device_context, const RECT& area, int center_x, int center_y,
@@ -278,6 +408,31 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     draw_text(device_context, L"INFINITE COORDINATE PLANE", subtitle_area,
         muted_text_color, small_font);
 
+    RECT molecule_button = molecule_tool_area(client_area);
+    const COLORREF button_fill = molecule_tool_active
+        ? RGB(26, 55, 61)
+        : RGB(20, 27, 39);
+    const COLORREF button_outline = molecule_tool_active
+        ? RGB(69, 142, 139)
+        : border_color;
+    HPEN button_pen = CreatePen(PS_SOLID, 1, button_outline);
+    HBRUSH button_brush = CreateSolidBrush(button_fill);
+    HPEN previous_button_pen =
+        static_cast<HPEN>(SelectObject(device_context, button_pen));
+    HBRUSH previous_button_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, button_brush));
+    RoundRect(device_context, molecule_button.left, molecule_button.top,
+        molecule_button.right, molecule_button.bottom, 10, 10);
+    SelectObject(device_context, previous_button_brush);
+    SelectObject(device_context, previous_button_pen);
+    DeleteObject(button_brush);
+    DeleteObject(button_pen);
+    RECT molecule_label{molecule_button.left + 10, molecule_button.top + 1,
+        molecule_button.right - 9, molecule_button.bottom - 1};
+    draw_text(device_context, L"+  Molecule", molecule_label,
+        molecule_tool_active ? x_axis_color : primary_text_color,
+        zoom_font, DT_CENTER);
+
     const int zoom_percent = rounded_pixel(view_state.zoom * 100.0);
     wchar_t zoom_label[32]{};
     std::swprintf(zoom_label, sizeof(zoom_label) / sizeof(zoom_label[0]),
@@ -309,15 +464,18 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     draw_line(device_context, client_area.left, footer.top,
         client_area.right, footer.top, border_color);
 
-    RECT instructions{20, footer.top + 3, client_area.right - 240, footer.bottom - 3};
-    draw_text(device_context, L"WASD / ARROWS  PAN     SCROLL  ZOOM     HOME  RESET",
-        instructions, muted_text_color, small_font);
+    RECT instructions{20, footer.top + 3, client_area.right - 380, footer.bottom - 3};
+    const wchar_t* hint = molecule_tool_active
+        ? L"CLICK TO PLACE MOLECULE     ESC CANCEL"
+        : L"WASD / ARROWS  PAN   SCROLL  ZOOM   C  MOLECULE";
+    draw_text(device_context, hint, instructions, muted_text_color, small_font);
 
-    wchar_t coordinates[96]{};
+    wchar_t coordinates[128]{};
     std::swprintf(coordinates, sizeof(coordinates) / sizeof(coordinates[0]),
-        L"CENTER   X %.2f   Y %.2f",
+        L"MOLECULES %llu   X %.2f   Y %.2f",
+        static_cast<unsigned long long>(molecules.size()),
         view_state.center_x, view_state.center_y);
-    RECT status_area{client_area.right - 228, footer.top + 3,
+    RECT status_area{client_area.right - 368, footer.top + 3,
         client_area.right - 18, footer.bottom - 3};
     draw_text(device_context, coordinates, status_area, primary_text_color,
         status_font, DT_RIGHT);
@@ -353,6 +511,7 @@ void draw_scene(HDC device_context, const RECT& client_area)
     {
         draw_grid(device_context, area, center_x, center_y, cell_size);
         draw_axes(device_context, area, center_x, center_y, cell_size, label_font);
+        draw_molecules(device_context, area, center_x, center_y, cell_size, label_font);
         draw_toolbar(device_context, client_area, title_font, small_font, zoom_font);
         draw_footer(device_context, client_area, small_font, status_font);
     }
@@ -389,6 +548,22 @@ void start_camera_motion(HWND window)
 {
     view_state.last_motion_tick = GetTickCount64();
     SetTimer(window, camera_timer_id, camera_timer_interval_ms, nullptr);
+}
+
+void set_molecule_tool(HWND window, bool active)
+{
+    molecule_tool_active = active;
+    pointer_over_scene = false;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    ScreenToClient(window, &cursor);
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT area = scene_area(client_area);
+    const bool over_scene = active && PtInRect(&area, cursor);
+    SetCursor(LoadCursorW(nullptr,
+        MAKEINTRESOURCEW(over_scene ? 32515 : 32512)));
+    InvalidateRect(window, nullptr, FALSE);
 }
 
 void stop_camera_motion(HWND window)
@@ -449,6 +624,19 @@ void reset_view()
     view_state.last_motion_tick = 0;
 }
 
+void place_molecule(const RECT& client_area, POINT position)
+{
+    const RECT area = scene_area(client_area);
+    const double cell_size = baseline_cell_size * view_state.zoom;
+    const int center_x = area.left + (area.right - area.left) / 2;
+    const int center_y = area.top + (area.bottom - area.top) / 2;
+    molecules.push_back(Molecule{
+        next_molecule_id++,
+        view_state.center_x + static_cast<double>(position.x - center_x) / cell_size,
+        view_state.center_y - static_cast<double>(position.y - center_y) / cell_size,
+        0.42});
+}
+
 LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPARAM l_param)
 {
     if (message == WM_ERASEBKGND)
@@ -495,6 +683,18 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
     if (message == WM_KEYDOWN)
     {
+        if (w_param == VK_ESCAPE && molecule_tool_active)
+        {
+            set_molecule_tool(window, false);
+            return 0;
+        }
+
+        if (w_param == 'C' && (l_param & (1L << 30)) == 0)
+        {
+            set_molecule_tool(window, !molecule_tool_active);
+            return 0;
+        }
+
         switch (w_param)
         {
         case VK_LEFT:
@@ -517,6 +717,87 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
         InvalidateRect(window, nullptr, FALSE);
         return 0;
+    }
+
+    if (message == WM_MOUSEMOVE)
+    {
+        POINT position{
+            static_cast<short>(LOWORD(l_param)),
+            static_cast<short>(HIWORD(l_param))};
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const RECT area = scene_area(client_area);
+        const bool over_scene = PtInRect(&area, position) != FALSE;
+        const bool changed = position.x != pointer_position.x ||
+            position.y != pointer_position.y || over_scene != pointer_over_scene;
+        pointer_position = position;
+        pointer_over_scene = over_scene;
+
+        TRACKMOUSEEVENT tracking{};
+        tracking.cbSize = sizeof(tracking);
+        tracking.dwFlags = TME_LEAVE;
+        tracking.hwndTrack = window;
+        TrackMouseEvent(&tracking);
+
+        if (molecule_tool_active)
+        {
+            SetCursor(LoadCursorW(nullptr,
+                MAKEINTRESOURCEW(over_scene ? 32515 : 32512)));
+        }
+        if (changed && molecule_tool_active)
+        {
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    if (message == WM_MOUSELEAVE)
+    {
+        pointer_over_scene = false;
+        if (molecule_tool_active)
+        {
+            SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    if (message == WM_LBUTTONDOWN)
+    {
+        const POINT position{
+            static_cast<short>(LOWORD(l_param)),
+            static_cast<short>(HIWORD(l_param))};
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const RECT button_area = molecule_tool_area(client_area);
+        if (PtInRect(&button_area, position))
+        {
+            SetFocus(window);
+            set_molecule_tool(window, !molecule_tool_active);
+            return 0;
+        }
+
+        const RECT area = scene_area(client_area);
+        if (molecule_tool_active && PtInRect(&area, position))
+        {
+            place_molecule(client_area, position);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+    }
+
+    if (message == WM_SETCURSOR && molecule_tool_active &&
+        LOWORD(l_param) == HTCLIENT)
+    {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        ScreenToClient(window, &cursor);
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const RECT area = scene_area(client_area);
+        SetCursor(LoadCursorW(nullptr,
+            MAKEINTRESOURCEW(PtInRect(&area, cursor) ? 32515 : 32512)));
+        return TRUE;
     }
 
     if (message == WM_TIMER && w_param == camera_timer_id)
