@@ -25,6 +25,10 @@ constexpr int simulation_tool_left = 420;
 constexpr int simulation_tool_width = 126;
 constexpr int simulation_tool_top = 14;
 constexpr int simulation_tool_height = 34;
+constexpr int graphics_tool_left = 724;
+constexpr int graphics_tool_width = 60;
+constexpr int graphics_tool_top = 14;
+constexpr int graphics_tool_height = 34;
 constexpr UINT_PTR camera_timer_id = 1;
 constexpr UINT_PTR telemetry_timer_id = 2;
 constexpr UINT_PTR simulation_timer_id = 3;
@@ -54,6 +58,22 @@ constexpr COLORREF muted_text_color = RGB(128, 144, 164);
 constexpr COLORREF x_axis_color = RGB(69, 214, 201);
 constexpr COLORREF y_axis_color = RGB(160, 132, 255);
 constexpr COLORREF z_axis_color = RGB(255, 174, 94);
+
+enum class GraphicsQuality
+{
+    performance,
+    balanced,
+    quality
+};
+
+enum GraphicsMenuCommand : UINT
+{
+    menu_toggle_fullscreen = 1,
+    menu_quality_performance,
+    menu_quality_balanced,
+    menu_quality_high,
+    menu_toggle_grid
+};
 
 using simulation::Vec3;
 
@@ -103,6 +123,16 @@ simulation::Engine simulation_engine;
 std::uint64_t next_molecule_id = 1;
 HDC window_device_context = nullptr;
 HGLRC open_gl_context = nullptr;
+HFONT title_font = nullptr;
+HFONT small_font = nullptr;
+HFONT button_font = nullptr;
+HFONT status_font = nullptr;
+GraphicsQuality graphics_quality = GraphicsQuality::balanced;
+bool grid_visible = true;
+bool fullscreen = false;
+WINDOWPLACEMENT windowed_placement{};
+LONG_PTR windowed_style = 0;
+LONG_PTR windowed_extended_style = 0;
 bool molecule_tool_active = false;
 bool bond_tool_active = false;
 std::uint64_t pending_bond_molecule_id = 0;
@@ -184,6 +214,57 @@ RECT simulation_tool_area(const RECT& client_area)
             client_area.top + simulation_tool_top,
             client_area.left + simulation_tool_left + simulation_tool_width,
             client_area.top + simulation_tool_top + simulation_tool_height};
+}
+
+RECT graphics_tool_area(const RECT& client_area)
+{
+    return RECT{
+        client_area.left + graphics_tool_left,
+        client_area.top + graphics_tool_top,
+        client_area.left + graphics_tool_left + graphics_tool_width,
+        client_area.top + graphics_tool_top + graphics_tool_height};
+}
+
+bool create_overlay_fonts(int dpi = 96)
+{
+    title_font = CreateFontW(-MulDiv(16, dpi, 96), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    small_font = CreateFontW(-MulDiv(10, dpi, 96), 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    button_font = CreateFontW(-MulDiv(12, dpi, 96), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    status_font = CreateFontW(-MulDiv(11, dpi, 96), 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    return title_font != nullptr && small_font != nullptr &&
+        button_font != nullptr && status_font != nullptr;
+}
+
+void destroy_overlay_fonts()
+{
+    if (title_font != nullptr)
+    {
+        DeleteObject(title_font);
+        title_font = nullptr;
+    }
+    if (small_font != nullptr)
+    {
+        DeleteObject(small_font);
+        small_font = nullptr;
+    }
+    if (button_font != nullptr)
+    {
+        DeleteObject(button_font);
+        button_font = nullptr;
+    }
+    if (status_font != nullptr)
+    {
+        DeleteObject(status_font);
+        status_font = nullptr;
+    }
 }
 
 void invalidate_simulation_ui(HWND window, bool toolbar)
@@ -406,6 +487,11 @@ double grid_extent()
 
 void draw_grid()
 {
+    if (!grid_visible)
+    {
+        return;
+    }
+
     const double extent = grid_extent();
     const double minimum_x = camera_state.target.x - extent;
     const double maximum_x = camera_state.target.x + extent;
@@ -415,12 +501,18 @@ void draw_grid()
     const int last_x = static_cast<int>(std::ceil(maximum_x));
     const int first_y = static_cast<int>(std::floor(minimum_y));
     const int last_y = static_cast<int>(std::ceil(maximum_y));
+    const int line_step =
+        graphics_quality == GraphicsQuality::performance ? 2 : 1;
 
     glDisable(GL_LIGHTING);
     glLineWidth(1.0F);
     glBegin(GL_LINES);
     for (int x = first_x; x <= last_x; ++x)
     {
+        if (x % line_step != 0)
+        {
+            continue;
+        }
         const bool major = x % 5 == 0;
         glColor4ub(major ? 36 : 25, major ? 49 : 34, major ? 65 : 47, 255);
         glVertex3d(x, minimum_y, 0.0);
@@ -428,6 +520,10 @@ void draw_grid()
     }
     for (int y = first_y; y <= last_y; ++y)
     {
+        if (y % line_step != 0)
+        {
+            continue;
+        }
         const bool major = y % 5 == 0;
         glColor4ub(major ? 36 : 25, major ? 49 : 34, major ? 65 : 47, 255);
         glVertex3d(minimum_x, y, 0.0);
@@ -490,8 +586,18 @@ void draw_simulation_boundaries()
 void draw_sphere(const Vec3& center, double radius, bool preview = false,
     bool selected = false, double charge = 0.0)
 {
-    constexpr int latitude_steps = 12;
-    constexpr int longitude_steps = 18;
+    int latitude_steps = 12;
+    int longitude_steps = 18;
+    if (graphics_quality == GraphicsQuality::performance)
+    {
+        latitude_steps = 8;
+        longitude_steps = 12;
+    }
+    else if (graphics_quality == GraphicsQuality::quality)
+    {
+        latitude_steps = 20;
+        longitude_steps = 30;
+    }
     if (preview)
     {
         glDisable(GL_LIGHTING);
@@ -625,8 +731,17 @@ void render_scene(const RECT& client_area)
     glEnable(GL_COLOR_MATERIAL);
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
     glEnable(GL_NORMALIZE);
-    glEnable(GL_LINE_SMOOTH);
-    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    if (graphics_quality == GraphicsQuality::performance)
+    {
+        glDisable(GL_LINE_SMOOTH);
+    }
+    else
+    {
+        glEnable(GL_LINE_SMOOTH);
+        glHint(GL_LINE_SMOOTH_HINT,
+            graphics_quality == GraphicsQuality::quality
+                ? GL_NICEST : GL_DONT_CARE);
+    }
 
     draw_grid();
     draw_simulation_boundaries();
@@ -749,6 +864,22 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
             client_area.left + 648, toolbar.top + 46},
         muted_text_color, small_font, DT_CENTER);
 
+    const RECT graphics_button = graphics_tool_area(client_area);
+    HPEN graphics_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH graphics_brush = CreateSolidBrush(RGB(20, 27, 39));
+    HPEN previous_graphics_pen =
+        static_cast<HPEN>(SelectObject(device_context, graphics_pen));
+    HBRUSH previous_graphics_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, graphics_brush));
+    RoundRect(device_context, graphics_button.left, graphics_button.top,
+        graphics_button.right, graphics_button.bottom, 10, 10);
+    SelectObject(device_context, previous_graphics_brush);
+    SelectObject(device_context, previous_graphics_pen);
+    DeleteObject(graphics_brush);
+    DeleteObject(graphics_pen);
+    draw_text(device_context, L"OPT", graphics_button, primary_text_color,
+        button_font, DT_CENTER);
+
     draw_text(device_context, L"X", RECT{654, toolbar.top + 16, 670, toolbar.top + 46},
         x_axis_color, status_font, DT_CENTER);
     draw_text(device_context, L"Y", RECT{678, toolbar.top + 16, 694, toolbar.top + 46},
@@ -756,7 +887,7 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     draw_text(device_context, L"Z", RECT{702, toolbar.top + 16, 718, toolbar.top + 46},
         z_axis_color, status_font, DT_CENTER);
 
-    if (scene_width(client_area) > 950)
+    if (scene_width(client_area) > 1050)
     {
         wchar_t camera_label[48]{};
         std::swprintf(camera_label,
@@ -935,19 +1066,6 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
 
 void draw_overlay(HDC device_context, const RECT& client_area)
 {
-    HFONT title_font = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HFONT small_font = CreateFontW(-10, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HFONT button_font = CreateFontW(-12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HFONT status_font = CreateFontW(-11, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-
     if (title_font != nullptr && small_font != nullptr &&
         button_font != nullptr && status_font != nullptr)
     {
@@ -955,22 +1073,177 @@ void draw_overlay(HDC device_context, const RECT& client_area)
             button_font, status_font);
         draw_footer(device_context, client_area, small_font, status_font);
     }
+}
 
-    if (title_font != nullptr)
+bool set_window_long_checked(HWND window, int index, LONG_PTR value);
+
+void toggle_fullscreen(HWND window)
+{
+    if (!fullscreen)
     {
-        DeleteObject(title_font);
+        windowed_placement.length = sizeof(windowed_placement);
+        if (!GetWindowPlacement(window, &windowed_placement))
+        {
+            MessageBoxW(window, L"Unable to save the current window placement.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        windowed_style = GetWindowLongPtrW(window, GWL_STYLE);
+        windowed_extended_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        const HMONITOR monitor =
+            MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitor_info{};
+        monitor_info.cbSize = sizeof(monitor_info);
+        if (!GetMonitorInfoW(monitor, &monitor_info))
+        {
+            MessageBoxW(window, L"Unable to determine the display bounds.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const LONG_PTR fullscreen_style =
+            (windowed_style & ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW)) |
+            WS_POPUP;
+        const LONG_PTR fullscreen_extended_style =
+            windowed_extended_style & ~static_cast<LONG_PTR>(WS_EX_WINDOWEDGE);
+        if (!set_window_long_checked(window, GWL_STYLE, fullscreen_style) ||
+            !set_window_long_checked(
+                window, GWL_EXSTYLE, fullscreen_extended_style))
+        {
+            set_window_long_checked(window, GWL_STYLE, windowed_style);
+            set_window_long_checked(
+                window, GWL_EXSTYLE, windowed_extended_style);
+            MessageBoxW(window, L"Unable to change the window display mode.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (!SetWindowPos(window, HWND_TOP,
+                monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+                monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER))
+        {
+            set_window_long_checked(window, GWL_STYLE, windowed_style);
+            set_window_long_checked(
+                window, GWL_EXSTYLE, windowed_extended_style);
+            SetWindowPlacement(window, &windowed_placement);
+            MessageBoxW(window, L"Unable to enter fullscreen mode.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        fullscreen = true;
     }
-    if (small_font != nullptr)
+    else
     {
-        DeleteObject(small_font);
+        if (!set_window_long_checked(window, GWL_STYLE, windowed_style) ||
+            !set_window_long_checked(
+                window, GWL_EXSTYLE, windowed_extended_style) ||
+            !SetWindowPlacement(window, &windowed_placement) ||
+            !SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                    SWP_NOZORDER | SWP_NOOWNERZORDER))
+        {
+            MessageBoxW(window, L"Unable to restore the windowed display.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        fullscreen = false;
     }
-    if (button_font != nullptr)
+
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+bool set_window_long_checked(HWND window, int index, LONG_PTR value)
+{
+    SetLastError(ERROR_SUCCESS);
+    SetWindowLongPtrW(window, index, value);
+    return GetLastError() == ERROR_SUCCESS;
+}
+
+void show_graphics_menu(HWND window)
+{
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
     {
-        DeleteObject(button_font);
+        MessageBoxW(window, L"Unable to open graphics settings.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
     }
-    if (status_font != nullptr)
+
+    UINT fullscreen_flags = MF_STRING;
+    if (fullscreen)
     {
-        DeleteObject(status_font);
+        fullscreen_flags |= MF_CHECKED;
+    }
+    UINT grid_flags = MF_STRING;
+    if (grid_visible)
+    {
+        grid_flags |= MF_CHECKED;
+    }
+    const UINT quality_performance_flags =
+        MF_STRING | (graphics_quality == GraphicsQuality::performance
+                ? MF_CHECKED : 0);
+    const UINT quality_balanced_flags =
+        MF_STRING | (graphics_quality == GraphicsQuality::balanced
+                ? MF_CHECKED : 0);
+    const UINT quality_high_flags =
+        MF_STRING | (graphics_quality == GraphicsQuality::quality
+                ? MF_CHECKED : 0);
+
+    const bool menu_ready =
+        AppendMenuW(menu, fullscreen_flags, menu_toggle_fullscreen,
+            L"Fullscreen  (F11)") &&
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Rendering quality") &&
+        AppendMenuW(menu, quality_performance_flags,
+            menu_quality_performance, L"Performance") &&
+        AppendMenuW(menu, quality_balanced_flags,
+            menu_quality_balanced, L"Balanced") &&
+        AppendMenuW(menu, quality_high_flags,
+            menu_quality_high, L"High quality") &&
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
+        AppendMenuW(menu, grid_flags, menu_toggle_grid, L"Show grid");
+    if (!menu_ready)
+    {
+        DestroyMenu(menu);
+        MessageBoxW(window, L"Unable to build the graphics settings menu.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT button = graphics_tool_area(client_area);
+    POINT menu_position{button.left, button.bottom};
+    ClientToScreen(window, &menu_position);
+    SetForegroundWindow(window);
+    const UINT command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        menu_position.x, menu_position.y, 0, window, nullptr);
+    DestroyMenu(menu);
+
+    switch (command)
+    {
+    case menu_toggle_fullscreen:
+        toggle_fullscreen(window);
+        break;
+    case menu_quality_performance:
+        graphics_quality = GraphicsQuality::performance;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_quality_balanced:
+        graphics_quality = GraphicsQuality::balanced;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_quality_high:
+        graphics_quality = GraphicsQuality::quality;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_toggle_grid:
+        grid_visible = !grid_visible;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    default:
+        break;
     }
 }
 
@@ -1368,6 +1641,77 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         glClearDepth(1.0);
         glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_NICEST);
         wglMakeCurrent(nullptr, nullptr);
+        if (!create_overlay_fonts())
+        {
+            destroy_overlay_fonts();
+            wglDeleteContext(open_gl_context);
+            open_gl_context = nullptr;
+            ReleaseDC(window, window_device_context);
+            window_device_context = nullptr;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (message == WM_SIZE)
+    {
+        if (w_param != SIZE_MINIMIZED)
+        {
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    if (message == WM_DISPLAYCHANGE)
+    {
+        if (fullscreen)
+        {
+            const HMONITOR monitor =
+                MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO monitor_info{};
+            monitor_info.cbSize = sizeof(monitor_info);
+            if (!GetMonitorInfoW(monitor, &monitor_info) ||
+                !SetWindowPos(window, HWND_TOP,
+                    monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+                    monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                    monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+                    SWP_FRAMECHANGED | SWP_NOOWNERZORDER))
+            {
+                MessageBoxW(window,
+                    L"Unable to resize the fullscreen window for the display.",
+                    L"Bonderium", MB_OK | MB_ICONERROR);
+            }
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+
+    if (message == WM_DPICHANGED)
+    {
+        if (!fullscreen)
+        {
+            const auto* suggested =
+                reinterpret_cast<const RECT*>(l_param);
+            if (!SetWindowPos(window, nullptr,
+                    suggested->left, suggested->top,
+                    suggested->right - suggested->left,
+                    suggested->bottom - suggested->top,
+                    SWP_NOZORDER | SWP_NOACTIVATE))
+            {
+                MessageBoxW(window, L"Unable to apply the display scaling.",
+                    L"Bonderium", MB_OK | MB_ICONERROR);
+            }
+        }
+        destroy_overlay_fonts();
+        if (!create_overlay_fonts(static_cast<int>(HIWORD(w_param))))
+        {
+            destroy_overlay_fonts();
+            MessageBoxW(window, L"Unable to recreate the interface fonts.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            PostMessageW(window, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        InvalidateRect(window, nullptr, FALSE);
         return 0;
     }
 
@@ -1414,6 +1758,11 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
     if (message == WM_KEYDOWN)
     {
+        if (w_param == VK_F11 && (l_param & (1L << 30)) == 0)
+        {
+            toggle_fullscreen(window);
+            return 0;
+        }
         if (w_param == VK_ESCAPE && (molecule_tool_active || bond_tool_active))
         {
             set_molecule_tool(window, false);
@@ -1701,6 +2050,13 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         GetClientRect(window, &client_area);
         const RECT button_area = molecule_tool_area(client_area);
         const RECT simulation_button = simulation_tool_area(client_area);
+        const RECT graphics_button = graphics_tool_area(client_area);
+        if (PtInRect(&graphics_button, position))
+        {
+            SetFocus(window);
+            show_graphics_menu(window);
+            return 0;
+        }
         if (PtInRect(&simulation_button, position))
         {
             SetFocus(window);
@@ -1871,6 +2227,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             wglDeleteContext(open_gl_context);
             open_gl_context = nullptr;
         }
+        destroy_overlay_fonts();
         if (window_device_context != nullptr)
         {
             ReleaseDC(window, window_device_context);
