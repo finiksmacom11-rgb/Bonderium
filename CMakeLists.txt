@@ -17,7 +17,7 @@ target_compile_definitions(Bonderium PRIVATE
     BONDERIUM_VERSION="${BONDERIUM_VERSION}"
     BONDERIUM_ENABLE_UPDATES=$<BOOL:${BONDERIUM_ENABLE_UPDATES}>
 )
-target_link_libraries(Bonderium PRIVATE shell32 winhttp)
+target_link_libraries(Bonderium PRIVATE shell32 winhttp opengl32)
 
 if(MSVC)
     target_compile_options(Bonderium PRIVATE /W4 /permissive- /utf-8)
