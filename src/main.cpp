@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <GL/gl.h>
 
+#include "simulation.h"
 #include "updater.h"
 
 #include <algorithm>
@@ -20,9 +21,16 @@ constexpr int molecule_tool_left = 258;
 constexpr int molecule_tool_width = 148;
 constexpr int molecule_tool_top = 14;
 constexpr int molecule_tool_height = 34;
+constexpr int simulation_tool_left = 420;
+constexpr int simulation_tool_width = 126;
+constexpr int simulation_tool_top = 14;
+constexpr int simulation_tool_height = 34;
 constexpr UINT_PTR camera_timer_id = 1;
 constexpr UINT_PTR telemetry_timer_id = 2;
+constexpr UINT_PTR simulation_timer_id = 3;
 constexpr UINT_PTR motion_timer_interval_ms = 16;
+constexpr UINT simulation_timer_interval_ms = 8;
+constexpr unsigned int maximum_catch_up_steps = 12;
 
 constexpr double camera_default_distance = 28.0;
 constexpr double camera_minimum_distance = 3.0;
@@ -32,6 +40,8 @@ constexpr double camera_move_speed = 12.0;
 constexpr double camera_ease_seconds = 0.12;
 constexpr double camera_stop_threshold = 0.015;
 constexpr double molecule_radius = 0.42;
+constexpr double molecule_sigma = 0.75;
+constexpr double molecule_epsilon = 0.1;
 constexpr double field_of_view = 45.0;
 constexpr double pi = 3.14159265358979323846;
 
@@ -45,12 +55,7 @@ constexpr COLORREF x_axis_color = RGB(69, 214, 201);
 constexpr COLORREF y_axis_color = RGB(160, 132, 255);
 constexpr COLORREF z_axis_color = RGB(255, 174, 94);
 
-struct Vec3
-{
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
+using simulation::Vec3;
 
 struct CameraState
 {
@@ -76,7 +81,10 @@ struct Telemetry
     unsigned int frames_since_sample = 0;
     double frames_per_second = 0.0;
     double frame_time_ms = 0.0;
+    double simulation_steps_per_second = 0.0;
     bool has_frame_sample = false;
+    std::uint64_t last_simulation_step_sample = 0;
+    ULONGLONG simulation_sample_started_at = 0;
 };
 
 struct CameraBasis
@@ -91,10 +99,16 @@ CameraState camera_state;
 Telemetry telemetry;
 LARGE_INTEGER performance_frequency{};
 std::vector<Molecule> molecules;
+simulation::Engine simulation_engine;
 std::uint64_t next_molecule_id = 1;
 HDC window_device_context = nullptr;
 HGLRC open_gl_context = nullptr;
 bool molecule_tool_active = false;
+bool bond_tool_active = false;
+std::uint64_t pending_bond_molecule_id = 0;
+bool simulation_running = false;
+double simulation_time_accumulator = 0.0;
+ULONGLONG last_simulation_tick = 0;
 double molecule_placement_height = molecule_radius;
 bool pointer_over_scene = false;
 bool orbit_dragging = false;
@@ -161,6 +175,34 @@ RECT molecule_tool_area(const RECT& client_area)
         client_area.top + molecule_tool_top,
         client_area.left + molecule_tool_left + molecule_tool_width,
         client_area.top + molecule_tool_top + molecule_tool_height};
+}
+
+RECT simulation_tool_area(const RECT& client_area)
+{
+        return RECT{
+            client_area.left + simulation_tool_left,
+            client_area.top + simulation_tool_top,
+            client_area.left + simulation_tool_left + simulation_tool_width,
+            client_area.top + simulation_tool_top + simulation_tool_height};
+}
+
+void invalidate_simulation_ui(HWND window, bool toolbar)
+{
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const RECT scene = scene_area(client_area);
+        const RECT footer{
+            client_area.left, client_area.bottom - footer_height,
+            client_area.right, client_area.bottom};
+        InvalidateRect(window, &scene, FALSE);
+        InvalidateRect(window, &footer, FALSE);
+        if (toolbar)
+        {
+            const RECT molecule_button = molecule_tool_area(client_area);
+            const RECT simulation_button = simulation_tool_area(client_area);
+            InvalidateRect(window, &molecule_button, FALSE);
+            InvalidateRect(window, &simulation_button, FALSE);
+        }
 }
 
 void fill_rectangle(HDC device_context, const RECT& area, COLORREF color)
@@ -315,6 +357,7 @@ Molecule* pick_molecule(const RECT& client_area, POINT screen)
             selected = &molecule;
         }
     }
+
     return selected;
 }
 
@@ -407,8 +450,45 @@ void draw_grid()
     glLineWidth(1.0F);
 }
 
+void draw_simulation_boundaries()
+{
+    const auto& config = simulation_engine.config();
+    if (config.boundary_mode == simulation::BoundaryMode::none)
+    {
+        return;
+    }
+
+    const double low = config.boundary_min;
+    const double high = config.boundary_max;
+    const Vec3 corners[]{
+        {low, low, low}, {high, low, low}, {high, high, low}, {low, high, low},
+        {low, low, high}, {high, low, high}, {high, high, high}, {low, high, high}};
+    constexpr int edges[][2]{
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    glDisable(GL_LIGHTING);
+    glLineWidth(1.5F);
+    glColor3ub(config.boundary_mode == simulation::BoundaryMode::soft
+            ? 255 : 160,
+        config.boundary_mode == simulation::BoundaryMode::soft
+            ? 174 : 132,
+        config.boundary_mode == simulation::BoundaryMode::soft
+            ? 94 : 255);
+    glBegin(GL_LINES);
+    for (const auto& edge : edges)
+    {
+        const Vec3 first = corners[edge[0]];
+        const Vec3 second = corners[edge[1]];
+        glVertex3d(first.x, first.y, first.z);
+        glVertex3d(second.x, second.y, second.z);
+    }
+    glEnd();
+    glLineWidth(1.0F);
+}
+
 void draw_sphere(const Vec3& center, double radius, bool preview = false,
-    bool selected = false)
+    bool selected = false, double charge = 0.0)
 {
     constexpr int latitude_steps = 12;
     constexpr int longitude_steps = 18;
@@ -428,7 +508,9 @@ void draw_sphere(const Vec3& center, double radius, bool preview = false,
         }
         else
         {
-            glColor3ub(69, 154, 160);
+            glColor3ub(charge > 0.0 ? 225 : charge < 0.0 ? 151 : 69,
+                charge < 0.0 ? 132 : 154,
+                charge > 0.0 ? 110 : charge < 0.0 ? 232 : 160);
         }
     }
 
@@ -472,8 +554,14 @@ void draw_molecules(const RECT& client_area)
         {
             continue;
         }
+        const std::size_t particle_index =
+            static_cast<std::size_t>(molecule.id - 1);
+        const double charge =
+            particle_index < simulation_engine.particles().size()
+            ? simulation_engine.particles()[particle_index].charge
+            : 0.0;
         draw_sphere(molecule.position, molecule.radius,
-            false, molecule.id == selected_molecule_id);
+            false, molecule.id == selected_molecule_id, charge);
     }
 
     Vec3 preview_position{};
@@ -485,6 +573,27 @@ void draw_molecules(const RECT& client_area)
             Vec3{preview_position.x, preview_position.y, molecule_placement_height},
             molecule_radius, true);
     }
+}
+
+void draw_bonds()
+{
+    glDisable(GL_LIGHTING);
+    glLineWidth(2.0F);
+    glColor3ub(255, 174, 94);
+    glBegin(GL_LINES);
+    for (const simulation::Bond& bond : simulation_engine.bonds())
+    {
+        if (bond.first >= molecules.size() || bond.second >= molecules.size())
+        {
+            continue;
+        }
+        const Vec3 first = molecules[bond.first].position;
+        const Vec3 second = molecules[bond.second].position;
+        glVertex3d(first.x, first.y, first.z);
+        glVertex3d(second.x, second.y, second.z);
+    }
+    glEnd();
+    glLineWidth(1.0F);
 }
 
 void render_scene(const RECT& client_area)
@@ -520,6 +629,8 @@ void render_scene(const RECT& client_area)
     glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
 
     draw_grid();
+    draw_simulation_boundaries();
+    draw_bonds();
     draw_molecules(client_area);
 
     glDisable(GL_LIGHTING);
@@ -580,28 +691,91 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         molecule_tool_active ? x_axis_color : primary_text_color,
         button_font, DT_CENTER);
 
-    draw_text(device_context, L"X", RECT{442, toolbar.top + 16, 458, toolbar.top + 46},
+    const RECT simulation_button = simulation_tool_area(client_area);
+    const COLORREF simulation_button_fill = simulation_running
+        ? RGB(23, 63, 57)
+        : RGB(20, 27, 39);
+    const COLORREF simulation_button_border = simulation_running
+        ? RGB(58, 158, 126)
+        : border_color;
+    HPEN simulation_pen = CreatePen(PS_SOLID, 1, simulation_button_border);
+    HBRUSH simulation_brush = CreateSolidBrush(simulation_button_fill);
+    HPEN previous_simulation_pen =
+        static_cast<HPEN>(SelectObject(device_context, simulation_pen));
+    HBRUSH previous_simulation_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, simulation_brush));
+    RoundRect(device_context, simulation_button.left, simulation_button.top,
+        simulation_button.right, simulation_button.bottom, 10, 10);
+    SelectObject(device_context, previous_simulation_brush);
+    SelectObject(device_context, previous_simulation_pen);
+    DeleteObject(simulation_brush);
+    DeleteObject(simulation_pen);
+    RECT simulation_label{
+        simulation_button.left + 6, simulation_button.top + 1,
+        simulation_button.right - 6, simulation_button.bottom - 1};
+    draw_text(device_context,
+        simulation_running ? L"PAUSE EXP" : L"START EXP",
+        simulation_label,
+        simulation_running ? x_axis_color : primary_text_color,
+        button_font, DT_CENTER);
+
+    const auto& config = simulation_engine.config();
+    const wchar_t* thermostat_label = L"OFF";
+    switch (config.thermostat)
+    {
+    case simulation::Thermostat::andersen:
+        thermostat_label = L"AND";
+        break;
+    case simulation::Thermostat::berendsen:
+        thermostat_label = L"BER";
+        break;
+    case simulation::Thermostat::acceleration_damping:
+        thermostat_label = L"DAMP";
+        break;
+    case simulation::Thermostat::none:
+        break;
+    }
+    wchar_t model_label[48]{};
+    std::swprintf(model_label, sizeof(model_label) / sizeof(model_label[0]),
+        L"%ls  %ls  %ls  %.2f",
+        config.integrator == simulation::Integrator::velocity_verlet
+            ? L"VV" : L"KDK",
+        thermostat_label,
+        config.coulomb_solver == simulation::CoulombSolver::direct
+            ? L"COUL" : L"TREE",
+        config.target_temperature);
+    draw_text(device_context, model_label,
+        RECT{client_area.left + 554, toolbar.top + 16,
+            client_area.left + 648, toolbar.top + 46},
+        muted_text_color, small_font, DT_CENTER);
+
+    draw_text(device_context, L"X", RECT{654, toolbar.top + 16, 670, toolbar.top + 46},
         x_axis_color, status_font, DT_CENTER);
-    draw_text(device_context, L"Y", RECT{466, toolbar.top + 16, 482, toolbar.top + 46},
+    draw_text(device_context, L"Y", RECT{678, toolbar.top + 16, 694, toolbar.top + 46},
         y_axis_color, status_font, DT_CENTER);
-    draw_text(device_context, L"Z", RECT{490, toolbar.top + 16, 506, toolbar.top + 46},
+    draw_text(device_context, L"Z", RECT{702, toolbar.top + 16, 718, toolbar.top + 46},
         z_axis_color, status_font, DT_CENTER);
 
-    wchar_t camera_label[48]{};
-    std::swprintf(camera_label, sizeof(camera_label) / sizeof(camera_label[0]),
-        L"CAMERA %.1f u", camera_state.distance);
-    RECT camera_area{client_area.right - 210, toolbar.top + 16,
-        client_area.right - 112, toolbar.top + 46};
-    draw_text(device_context, camera_label, camera_area, muted_text_color,
-        small_font, DT_RIGHT);
+    if (scene_width(client_area) > 950)
+    {
+        wchar_t camera_label[48]{};
+        std::swprintf(camera_label,
+            sizeof(camera_label) / sizeof(camera_label[0]),
+            L"CAMERA %.1f u", camera_state.distance);
+        RECT camera_area{client_area.right - 210, toolbar.top + 16,
+            client_area.right - 112, toolbar.top + 46};
+        draw_text(device_context, camera_label, camera_area, muted_text_color,
+            small_font, DT_RIGHT);
 
-    wchar_t molecule_count[32]{};
-    std::swprintf(molecule_count, sizeof(molecule_count) / sizeof(molecule_count[0]),
-        L"%llu", static_cast<unsigned long long>(molecules.size()));
-    RECT count_area{client_area.right - 104, toolbar.top + 16,
-        client_area.right - 72, toolbar.top + 46};
-    draw_text(device_context, molecule_count, count_area,
-        primary_text_color, status_font, DT_RIGHT);
+        wchar_t molecule_count[32]{};
+        std::swprintf(molecule_count,
+            sizeof(molecule_count) / sizeof(molecule_count[0]),
+            L"%llu", static_cast<unsigned long long>(molecules.size()));
+        RECT count_area{client_area.right - 104, toolbar.top + 16,
+            client_area.right - 72, toolbar.top + 46};
+        draw_text(device_context, molecule_count, count_area,
+            primary_text_color, status_font, DT_RIGHT);
+    }
     draw_filled_circle(device_context, client_area.right - 42,
         brand_center_y, 5, RGB(22, 53, 64), x_axis_color);
 }
@@ -617,6 +791,9 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
 
     wchar_t fps_value[24]{};
     wchar_t molecule_value[24]{};
+    wchar_t charge_value[24]{};
+    wchar_t temperature_value[24]{};
+    wchar_t energy_value[24]{};
     wchar_t frame_time_value[24]{};
     wchar_t camera_value[32]{};
     wchar_t uptime_value[24]{};
@@ -624,6 +801,26 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         L"%.0f", telemetry.frames_per_second);
     std::swprintf(molecule_value, sizeof(molecule_value) / sizeof(molecule_value[0]),
         L"%llu", static_cast<unsigned long long>(molecules.size()));
+    if (selected_molecule_id > 0 &&
+        selected_molecule_id <= simulation_engine.particles().size())
+    {
+        const double selected_charge = simulation_engine.particles()[
+            static_cast<std::size_t>(selected_molecule_id - 1)].charge;
+        std::swprintf(charge_value,
+            sizeof(charge_value) / sizeof(charge_value[0]),
+            L"%+.1f", selected_charge);
+    }
+    else
+    {
+        std::swprintf(charge_value,
+            sizeof(charge_value) / sizeof(charge_value[0]), L"—");
+    }
+    std::swprintf(temperature_value,
+        sizeof(temperature_value) / sizeof(temperature_value[0]),
+        L"%.3f", simulation_engine.metrics().temperature);
+    std::swprintf(energy_value,
+        sizeof(energy_value) / sizeof(energy_value[0]),
+        L"%.3f", simulation_engine.metrics().potential_energy);
     if (telemetry.has_frame_sample)
     {
         std::swprintf(frame_time_value,
@@ -664,12 +861,19 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     const Metric metrics[]{
         {L"FPS", fps_value},
         {L"MOLECULES", molecule_value},
-        {L"STEPS / SEC", L"OFF"},
+        {L"STEPS / SEC", nullptr},
+        {L"CHARGE", charge_value},
+        {L"TEMP", temperature_value},
+        {L"POTENTIAL", energy_value},
         {L"PING", L"N/A"},
         {L"FRAME", frame_time_value},
         {L"CAMERA SPEED", camera_value},
         {L"UPTIME", uptime_value}};
     constexpr int metric_count = static_cast<int>(sizeof(metrics) / sizeof(metrics[0]));
+    wchar_t simulation_steps_value[24]{};
+    std::swprintf(simulation_steps_value,
+        sizeof(simulation_steps_value) / sizeof(simulation_steps_value[0]),
+        L"%.0f", telemetry.simulation_steps_per_second);
     const int column_width = scene_width(client_area) / metric_count;
     for (int index = 0; index < metric_count; ++index)
     {
@@ -681,7 +885,10 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         RECT value_area{left + 4, footer.top + 23, right - 4, footer.top + 44};
         draw_text(device_context, metrics[index].label, label_area,
             muted_text_color, small_font, DT_CENTER);
-        draw_text(device_context, metrics[index].value, value_area,
+        const wchar_t* metric_value = index == 2
+            ? simulation_steps_value
+            : metrics[index].value;
+        draw_text(device_context, metric_value, value_area,
             index == 0 ? x_axis_color : primary_text_color,
             status_font, DT_CENTER);
         if (index > 0)
@@ -696,17 +903,34 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     RECT instructions{16, footer.top + 49, client_area.right - 390, footer.bottom - 1};
     const wchar_t* hint = molecule_tool_active
         ? L"CLICK PLACE   SHIFT+WHEEL HEIGHT   ESC CANCEL"
-        : L"DRAG OBJECT   WASD MOVE   Q/E HEIGHT   RIGHT ORBIT   MIDDLE PAN   WHEEL ZOOM";
+        : bond_tool_active
+        ? L"CLICK TWO MOLECULES TO BOND   ESC CANCEL"
+        : L"WASD/QE MOVE   RMB ORBIT   MMB PAN   WHEEL ZOOM   SPACE SIM";
     draw_text(device_context, hint, instructions, muted_text_color, small_font);
 
-    wchar_t coordinates[128]{};
-    std::swprintf(coordinates, sizeof(coordinates) / sizeof(coordinates[0]),
-        L"X %.2f   Y %.2f   Z %.2f",
-        camera_state.target.x, camera_state.target.y, camera_state.target.z);
+    wchar_t coordinates[3][32]{};
+    std::swprintf(coordinates[0], sizeof(coordinates[0]) / sizeof(coordinates[0][0]),
+        L"X: %.2f", camera_state.target.x);
+    std::swprintf(coordinates[1], sizeof(coordinates[1]) / sizeof(coordinates[1][0]),
+        L"Y: %.2f", camera_state.target.y);
+    std::swprintf(coordinates[2], sizeof(coordinates[2]) / sizeof(coordinates[2][0]),
+        L"Z: %.2f", camera_state.target.z);
     RECT status_area{client_area.right - 378, footer.top + 49,
         client_area.right - 16, footer.bottom - 1};
-    draw_text(device_context, coordinates, status_area,
-        primary_text_color, status_font, DT_RIGHT);
+    const int coordinate_width =
+        (status_area.right - status_area.left) / 3;
+    const COLORREF coordinate_colors[]{x_axis_color, y_axis_color, z_axis_color};
+    for (int index = 0; index < 3; ++index)
+    {
+        RECT coordinate_area{
+            status_area.left + index * coordinate_width,
+            status_area.top,
+            index == 2 ? status_area.right
+                       : status_area.left + (index + 1) * coordinate_width,
+            status_area.bottom};
+        draw_text(device_context, coordinates[index], coordinate_area,
+            coordinate_colors[index], status_font, DT_CENTER);
+    }
 }
 
 void draw_overlay(HDC device_context, const RECT& client_area)
@@ -771,6 +995,8 @@ void stop_camera_motion(HWND window)
 void set_molecule_tool(HWND window, bool active)
 {
     molecule_tool_active = active;
+    bond_tool_active = false;
+    pending_bond_molecule_id = 0;
     pointer_over_scene = false;
     POINT cursor{};
     GetCursorPos(&cursor);
@@ -782,10 +1008,165 @@ void set_molecule_tool(HWND window, bool active)
     SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(over_scene ? 32515 : 32512)));
     const RECT button_area = molecule_tool_area(client_area);
     InvalidateRect(window, &button_area, FALSE);
+    const RECT simulation_button = simulation_tool_area(client_area);
+    InvalidateRect(window, &simulation_button, FALSE);
+    const RECT footer{
+        client_area.left, client_area.bottom - footer_height,
+        client_area.right, client_area.bottom};
+    InvalidateRect(window, &footer, FALSE);
     if (over_scene)
     {
         InvalidateRect(window, &area, FALSE);
     }
+}
+
+void set_bond_tool(HWND window, bool active)
+{
+    bond_tool_active = active;
+    pending_bond_molecule_id = 0;
+    molecule_tool_active = false;
+    pointer_over_scene = false;
+    SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+    invalidate_simulation_ui(window, true);
+}
+
+void set_simulation_running(HWND window, bool running)
+{
+    if (running && simulation_engine.particles().empty())
+    {
+        MessageBoxW(window,
+            L"Place at least one molecule before starting the simulation.",
+            L"Bonderium — Experimental molecular dynamics",
+            MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    simulation_running = running;
+    simulation_time_accumulator = 0.0;
+    last_simulation_tick = GetTickCount64();
+    if (simulation_running)
+    {
+        SetTimer(window, simulation_timer_id,
+            simulation_timer_interval_ms, nullptr);
+    }
+    else
+    {
+        KillTimer(window, simulation_timer_id);
+    }
+
+    invalidate_simulation_ui(window, true);
+}
+
+void update_simulation(HWND window)
+{
+    const ULONGLONG now = GetTickCount64();
+    const double elapsed = (std::min)(0.05,
+        static_cast<double>(now - last_simulation_tick) / 1000.0);
+    last_simulation_tick = now;
+    const double time_step = simulation_engine.config().time_step;
+    simulation_time_accumulator = (std::min)(
+        simulation_time_accumulator + elapsed,
+        time_step * maximum_catch_up_steps);
+
+    unsigned int completed_steps = 0;
+    std::string error;
+    while (simulation_time_accumulator >= time_step &&
+        completed_steps < maximum_catch_up_steps)
+    {
+        if (!simulation_engine.step(error))
+        {
+            set_simulation_running(window, false);
+            const std::wstring message(error.begin(), error.end());
+            MessageBoxW(window, message.c_str(),
+                L"Simulation stopped — invalid state",
+                MB_OK | MB_ICONERROR);
+            return;
+        }
+        simulation_time_accumulator -= time_step;
+        ++completed_steps;
+    }
+
+    const auto& particles = simulation_engine.particles();
+    for (std::size_t index = 0;
+         index < (std::min)(particles.size(), molecules.size()); ++index)
+    {
+        molecules[index].position = particles[index].position;
+    }
+
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT area = scene_area(client_area);
+    InvalidateRect(window, &area, FALSE);
+}
+
+void adjust_selected_charge(HWND window, double delta)
+{
+    if (selected_molecule_id == 0 ||
+        selected_molecule_id > simulation_engine.particles().size())
+    {
+        MessageBoxW(window, L"Select a molecule before changing its charge.",
+            L"Bonderium", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const std::size_t index =
+        static_cast<std::size_t>(selected_molecule_id - 1);
+    const double charge =
+        simulation_engine.particles()[index].charge + delta;
+    if (!simulation_engine.set_charge(index, charge))
+    {
+        MessageBoxW(window, L"Unable to update the selected molecule charge.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void adjust_target_temperature(HWND window, double delta)
+{
+    simulation_engine.config().target_temperature = (std::clamp)(
+        simulation_engine.config().target_temperature + delta, 0.0, 10.0);
+    invalidate_simulation_ui(window, true);
+}
+
+void select_bond_endpoint(HWND window, POINT screen)
+{
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    Molecule* molecule = pick_molecule(client_area, screen);
+    if (molecule == nullptr)
+    {
+        return;
+    }
+    selected_molecule_id = molecule->id;
+    if (pending_bond_molecule_id == 0)
+    {
+        pending_bond_molecule_id = molecule->id;
+        invalidate_simulation_ui(window, false);
+        return;
+    }
+    if (pending_bond_molecule_id == molecule->id)
+    {
+        pending_bond_molecule_id = 0;
+        invalidate_simulation_ui(window, false);
+        return;
+    }
+
+    const std::size_t first =
+        static_cast<std::size_t>(pending_bond_molecule_id - 1);
+    const std::size_t second = static_cast<std::size_t>(molecule->id - 1);
+    const Vec3 displacement =
+        molecules[first].position - molecules[second].position;
+    const double equilibrium_length = std::sqrt(dot(displacement, displacement));
+    std::string error;
+    if (!simulation_engine.add_bond(
+            simulation::Bond{first, second, equilibrium_length, 10.0}, error))
+    {
+        const std::wstring message(error.begin(), error.end());
+        MessageBoxW(window, message.c_str(), L"Unable to create bond",
+            MB_OK | MB_ICONERROR);
+    }
+    pending_bond_molecule_id = 0;
+    invalidate_simulation_ui(window, false);
 }
 
 void update_camera_motion(HWND window)
@@ -857,6 +1238,17 @@ void place_molecule(HWND window, POINT position)
     }
     const std::uint64_t id = next_molecule_id++;
     molecules.push_back(Molecule{id, world_position, molecule_radius});
+    const std::size_t particle_index =
+        simulation_engine.add_particle(world_position);
+    if (!simulation_engine.set_particle_properties(particle_index, 1.0, 0.0,
+            molecule_sigma, molecule_epsilon, false))
+    {
+        molecules.pop_back();
+        --next_molecule_id;
+        MessageBoxW(window, L"Unable to initialize molecule physics properties.",
+            L"Simulation error", MB_OK | MB_ICONERROR);
+        return;
+    }
     selected_molecule_id = id;
     molecule_dragging = true;
     molecule_drag_offset = Vec3{};
@@ -1022,7 +1414,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
     if (message == WM_KEYDOWN)
     {
-        if (w_param == VK_ESCAPE && molecule_tool_active)
+        if (w_param == VK_ESCAPE && (molecule_tool_active || bond_tool_active))
         {
             set_molecule_tool(window, false);
             return 0;
@@ -1031,6 +1423,105 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         {
             set_molecule_tool(window, !molecule_tool_active);
             return 0;
+        }
+        if (w_param == VK_SPACE && (l_param & (1L << 30)) == 0)
+        {
+            set_simulation_running(window, !simulation_running);
+            return 0;
+        }
+        if (w_param == 'B' && (l_param & (1L << 30)) == 0)
+        {
+            set_bond_tool(window, !bond_tool_active);
+            return 0;
+        }
+        if (w_param == VK_OEM_4 && (l_param & (1L << 30)) == 0)
+        {
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+            {
+                adjust_target_temperature(window, -0.05);
+            }
+            else
+            {
+                adjust_selected_charge(window, -0.5);
+            }
+            return 0;
+        }
+        if (w_param == VK_OEM_6 && (l_param & (1L << 30)) == 0)
+        {
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+            {
+                adjust_target_temperature(window, 0.05);
+            }
+            else
+            {
+                adjust_selected_charge(window, 0.5);
+            }
+            return 0;
+        }
+        if ((l_param & (1L << 30)) == 0)
+        {
+            auto& config = simulation_engine.config();
+            bool controls_changed = true;
+            switch (w_param)
+            {
+            case 'T':
+                switch (config.thermostat)
+                {
+                case simulation::Thermostat::none:
+                    config.thermostat = simulation::Thermostat::andersen;
+                    break;
+                case simulation::Thermostat::andersen:
+                    config.thermostat = simulation::Thermostat::berendsen;
+                    break;
+                case simulation::Thermostat::berendsen:
+                    config.thermostat =
+                        simulation::Thermostat::acceleration_damping;
+                    break;
+                case simulation::Thermostat::acceleration_damping:
+                    config.thermostat = simulation::Thermostat::none;
+                    break;
+                }
+                break;
+            case 'I':
+                config.integrator =
+                    config.integrator == simulation::Integrator::velocity_verlet
+                    ? simulation::Integrator::kick_drift_kick
+                    : simulation::Integrator::velocity_verlet;
+                break;
+            case 'O':
+                config.coulomb_solver =
+                    config.coulomb_solver == simulation::CoulombSolver::direct
+                    ? simulation::CoulombSolver::barnes_hut
+                    : simulation::CoulombSolver::direct;
+                break;
+            case 'P':
+                switch (config.boundary_mode)
+                {
+                case simulation::BoundaryMode::none:
+                    config.boundary_mode = simulation::BoundaryMode::soft;
+                    break;
+                case simulation::BoundaryMode::soft:
+                    config.boundary_mode =
+                        simulation::BoundaryMode::reflective;
+                    break;
+                case simulation::BoundaryMode::reflective:
+                    config.boundary_mode = simulation::BoundaryMode::none;
+                    break;
+                }
+                break;
+            case 'G':
+                config.gravity_z = config.gravity_z == 0.0 ? -1.0 : 0.0;
+                break;
+            default:
+                controls_changed = false;
+                break;
+            }
+            if (controls_changed)
+            {
+                simulation_engine.invalidate_forces();
+                invalidate_simulation_ui(window, true);
+                return 0;
+            }
         }
 
         switch (w_param)
@@ -1107,6 +1598,15 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                         cursor_position))
                 {
                     molecule.position = cursor_position + molecule_drag_offset;
+                    const std::size_t particle_index =
+                        static_cast<std::size_t>(molecule.id - 1);
+                    if (!simulation_engine.set_position(
+                            particle_index, molecule.position) ||
+                        !simulation_engine.set_velocity(
+                            particle_index, Vec3{}))
+                    {
+                        set_simulation_running(window, false);
+                    }
                 }
                 break;
             }
@@ -1200,6 +1700,13 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         RECT client_area{};
         GetClientRect(window, &client_area);
         const RECT button_area = molecule_tool_area(client_area);
+        const RECT simulation_button = simulation_tool_area(client_area);
+        if (PtInRect(&simulation_button, position))
+        {
+            SetFocus(window);
+            set_simulation_running(window, !simulation_running);
+            return 0;
+        }
         if (PtInRect(&button_area, position))
         {
             SetFocus(window);
@@ -1207,10 +1714,15 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             return 0;
         }
         const RECT area = scene_area(client_area);
+        if (bond_tool_active && PtInRect(&area, position))
+        {
+            select_bond_endpoint(window, position);
+            return 0;
+        }
         if (molecule_tool_active && PtInRect(&area, position))
         {
             place_molecule(window, position);
-            InvalidateRect(window, &area, FALSE);
+            invalidate_simulation_ui(window, false);
             return 0;
         }
         if (PtInRect(&area, position))
@@ -1219,13 +1731,17 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             {
                 if (molecule_dragging)
                 {
+                    if (simulation_running)
+                    {
+                        set_simulation_running(window, false);
+                    }
                     SetCapture(window);
                 }
-                InvalidateRect(window, &area, FALSE);
+                invalidate_simulation_ui(window, false);
                 return 0;
             }
             selected_molecule_id = 0;
-            InvalidateRect(window, &area, FALSE);
+            invalidate_simulation_ui(window, false);
         }
     }
 
@@ -1288,8 +1804,38 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         return 0;
     }
 
+    if (message == WM_TIMER && w_param == simulation_timer_id)
+    {
+        update_simulation(window);
+        return 0;
+    }
+
     if (message == WM_TIMER && w_param == telemetry_timer_id)
     {
+        const ULONGLONG now = GetTickCount64();
+        if (telemetry.simulation_sample_started_at == 0)
+        {
+            telemetry.simulation_sample_started_at = now;
+            telemetry.last_simulation_step_sample =
+                simulation_engine.metrics().steps;
+        }
+        else
+        {
+            const ULONGLONG elapsed = now -
+                telemetry.simulation_sample_started_at;
+            if (elapsed >= 500)
+            {
+                const std::uint64_t steps =
+                    simulation_engine.metrics().steps -
+                    telemetry.last_simulation_step_sample;
+                telemetry.simulation_steps_per_second =
+                    static_cast<double>(steps) * 1000.0 /
+                    static_cast<double>(elapsed);
+                telemetry.last_simulation_step_sample =
+                    simulation_engine.metrics().steps;
+                telemetry.simulation_sample_started_at = now;
+            }
+        }
         RECT client_area{};
         GetClientRect(window, &client_area);
         const RECT footer{client_area.left, client_area.bottom - footer_height,
@@ -1318,6 +1864,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     {
         KillTimer(window, camera_timer_id);
         KillTimer(window, telemetry_timer_id);
+        KillTimer(window, simulation_timer_id);
         if (open_gl_context != nullptr)
         {
             wglMakeCurrent(nullptr, nullptr);
