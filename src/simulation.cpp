@@ -507,6 +507,17 @@ bool Engine::set_velocity(std::size_t index, Vec3 velocity)
     return true;
 }
 
+bool Engine::set_external_force(std::size_t index, Vec3 force)
+{
+    if (index >= particles_.size() || !finite(force))
+    {
+        return false;
+    }
+    particles_[index].external_force = force;
+    forces_initialized_ = false;
+    return true;
+}
+
 bool Engine::set_charge(std::size_t index, double charge)
 {
     if (index >= particles_.size() || !std::isfinite(charge))
@@ -779,10 +790,12 @@ bool Engine::compute_forces(std::string& error)
 
     for (Particle& particle : particles_)
     {
-        particle.force = Vec3{0.0, 0.0, particle.mass * config_.gravity_z};
+        particle.force = particle.external_force +
+            Vec3{0.0, 0.0, particle.mass * config_.gravity_z};
     }
 
     double potential_energy = 0.0;
+    double virial = 0.0;
     const double cutoff_squared = config_.cutoff * config_.cutoff;
     for (const NeighborPair& pair : neighbor_pairs_)
     {
@@ -815,14 +828,16 @@ bool Engine::compute_forces(std::string& error)
         const double force_scale =
             24.0 * pair.epsilon * (2.0 * ratio_twelve - ratio_six) /
             distance_squared;
-        add_pair_force(particles_, first_index, second_index,
-            displacement * force_scale);
+        const Vec3 force = displacement * force_scale;
+        add_pair_force(particles_, first_index, second_index, force);
+        virial += dot(displacement, force);
     }
 
     if (config_.coulomb_solver == CoulombSolver::barnes_hut &&
         particles_.size() >= barnes_hut_minimum_particles)
     {
         const BarnesHutTree tree(particles_, config_.barnes_hut_theta);
+        std::vector<Vec3> coulomb_forces(particles_.size());
         for (std::size_t index = 0; index < particles_.size(); ++index)
         {
             if (particles_[index].charge == 0.0)
@@ -838,7 +853,19 @@ bool Engine::compute_forces(std::string& error)
                 return false;
             }
             particles_[index].force += force;
+            coulomb_forces[index] = force;
             potential_energy += 0.5 * particle_potential;
+        }
+        Vec3 origin{};
+        for (const Particle& particle : particles_)
+        {
+            origin += particle.position;
+        }
+        origin = origin / static_cast<double>(particles_.size());
+        for (std::size_t index = 0; index < particles_.size(); ++index)
+        {
+            virial += 0.5 * dot(
+                particles_[index].position - origin, coulomb_forces[index]);
         }
     }
     else
@@ -866,9 +893,10 @@ bool Engine::compute_forces(std::string& error)
                 const double coefficient = config_.coulomb_constant *
                     first.charge * second.charge;
                 potential_energy += coefficient / distance;
-                add_pair_force(particles_, first_index, second_index,
-                    displacement * (coefficient /
-                        (distance_squared * distance)));
+                const Vec3 force = displacement * (coefficient /
+                    (distance_squared * distance));
+                add_pair_force(particles_, first_index, second_index, force);
+                virial += dot(displacement, force);
             }
         }
     }
@@ -889,6 +917,7 @@ bool Engine::compute_forces(std::string& error)
         const Vec3 force = displacement *
             (-bond.stiffness * extension / distance);
         add_pair_force(particles_, bond.first, bond.second, force);
+        virial += dot(displacement, force);
     }
 
     for (const Angle& angle : angles_)
@@ -931,6 +960,8 @@ bool Engine::compute_forces(std::string& error)
         first.force += first_force;
         third.force += third_force;
         center.force += (first_force + third_force) * -1.0;
+        virial += dot(first_arm, first_force) +
+            dot(third_arm, third_force);
     }
 
     for (std::size_t index = 0; index < particles_.size(); ++index)
@@ -973,6 +1004,13 @@ bool Engine::compute_forces(std::string& error)
                         particle.force.z += side == 0
                             ? force_magnitude : -force_magnitude;
                     }
+                    const double coordinate = axis == 0
+                        ? particle.position.x
+                        : axis == 1 ? particle.position.y : particle.position.z;
+                    const double boundary_center =
+                        (config_.boundary_min + config_.boundary_max) * 0.5;
+                    virial += (coordinate - boundary_center) *
+                        (side == 0 ? force_magnitude : -force_magnitude);
                     potential_energy += energy;
                 }
             }
@@ -982,6 +1020,7 @@ bool Engine::compute_forces(std::string& error)
     }
 
     metrics_.potential_energy = potential_energy;
+    metrics_.configurational_virial = virial;
     return true;
 }
 
@@ -1093,7 +1132,12 @@ void Engine::apply_thermostat()
 void Engine::update_metrics()
 {
     metrics_.kinetic_energy = kinetic_energy(particles_);
+    metrics_.total_energy =
+        metrics_.kinetic_energy + metrics_.potential_energy;
     metrics_.temperature = 0.0;
+    metrics_.pressure = 0.0;
+    metrics_.number_density = 0.0;
+    metrics_.pressure_available = false;
     std::size_t mobile_count = 0;
     for (const Particle& particle : particles_)
     {
@@ -1106,6 +1150,20 @@ void Engine::update_metrics()
     {
         metrics_.temperature = metrics_.kinetic_energy * 2.0 /
             (3.0 * static_cast<double>(mobile_count));
+    }
+    if (config_.boundary_mode != BoundaryMode::none)
+    {
+        const double length = config_.boundary_max - config_.boundary_min;
+        const double volume = length * length * length;
+        metrics_.number_density =
+            static_cast<double>(particles_.size()) / volume;
+        if (!particles_.empty())
+        {
+            metrics_.pressure =
+                (2.0 * metrics_.kinetic_energy +
+                    metrics_.configurational_virial) / (3.0 * volume);
+            metrics_.pressure_available = true;
+        }
     }
     metrics_.neighbor_pairs = neighbor_pairs_.size();
 }

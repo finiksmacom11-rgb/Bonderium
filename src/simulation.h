@@ -19,6 +19,7 @@ struct Particle
     Vec3 position;
     Vec3 velocity;
     Vec3 force;
+    Vec3 external_force;
     double mass = 1.0;
     double charge = 0.0;
     double sigma = 0.75;
@@ -98,7 +99,12 @@ struct Metrics
     std::size_t neighbor_pairs = 0;
     double kinetic_energy = 0.0;
     double potential_energy = 0.0;
+    double total_energy = 0.0;
     double temperature = 0.0;
+    double configurational_virial = 0.0;
+    double pressure = 0.0;
+    double number_density = 0.0;
+    bool pressure_available = false;
 };
 
 class Engine
@@ -109,6 +115,7 @@ public:
     bool add_angle(Angle angle, std::string& error);
     bool set_position(std::size_t index, Vec3 position);
     bool set_velocity(std::size_t index, Vec3 velocity);
+    bool set_external_force(std::size_t index, Vec3 force);
     bool set_charge(std::size_t index, double charge);
     bool set_particle_properties(std::size_t index, double mass, double charge,
         double sigma, double epsilon, bool fixed);

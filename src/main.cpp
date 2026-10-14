@@ -16,7 +16,7 @@ constexpr wchar_t window_title[] = L"Bonderium — 3D Molecular Space";
 constexpr wchar_t window_class_name[] = L"BonderiumWindow";
 
 constexpr int toolbar_height = 62;
-constexpr int footer_height = 76;
+constexpr int footer_height = 116;
 constexpr int molecule_tool_left = 258;
 constexpr int molecule_tool_width = 148;
 constexpr int molecule_tool_top = 14;
@@ -29,6 +29,10 @@ constexpr int graphics_tool_left = 724;
 constexpr int graphics_tool_width = 60;
 constexpr int graphics_tool_top = 14;
 constexpr int graphics_tool_height = 34;
+constexpr int interaction_tool_left = 798;
+constexpr int interaction_tool_width = 112;
+constexpr int interaction_tool_top = 14;
+constexpr int interaction_tool_height = 34;
 constexpr UINT_PTR camera_timer_id = 1;
 constexpr UINT_PTR telemetry_timer_id = 2;
 constexpr UINT_PTR simulation_timer_id = 3;
@@ -46,6 +50,9 @@ constexpr double camera_stop_threshold = 0.015;
 constexpr double molecule_radius = 0.42;
 constexpr double molecule_sigma = 0.75;
 constexpr double molecule_epsilon = 0.1;
+constexpr double spring_drag_stiffness = 30.0;
+constexpr double directional_force_scale = 18.0;
+constexpr double maximum_interaction_force = 200.0;
 constexpr double field_of_view = 45.0;
 constexpr double pi = 3.14159265358979323846;
 
@@ -73,6 +80,20 @@ enum GraphicsMenuCommand : UINT
     menu_quality_balanced,
     menu_quality_high,
     menu_toggle_grid
+};
+
+enum class InteractionTool
+{
+    select,
+    spring_drag,
+    directional_force
+};
+
+enum InteractionMenuCommand : UINT
+{
+    menu_interaction_select = 101,
+    menu_interaction_spring_drag,
+    menu_interaction_directional_force
 };
 
 using simulation::Vec3;
@@ -144,10 +165,13 @@ bool pointer_over_scene = false;
 bool orbit_dragging = false;
 bool pan_dragging = false;
 bool molecule_dragging = false;
+InteractionTool interaction_tool = InteractionTool::spring_drag;
+std::size_t interacting_particle = static_cast<std::size_t>(-1);
 std::uint64_t selected_molecule_id = 0;
 Vec3 molecule_drag_offset{};
 POINT pointer_position{};
 POINT drag_last_position{};
+POINT force_drag_start_position{};
 
 Vec3 operator+(Vec3 left, Vec3 right)
 {
@@ -225,6 +249,15 @@ RECT graphics_tool_area(const RECT& client_area)
         client_area.top + graphics_tool_top + graphics_tool_height};
 }
 
+RECT interaction_tool_area(const RECT& client_area)
+{
+        return RECT{
+            client_area.left + interaction_tool_left,
+            client_area.top + interaction_tool_top,
+            client_area.left + interaction_tool_left + interaction_tool_width,
+            client_area.top + interaction_tool_top + interaction_tool_height};
+}
+
 bool create_overlay_fonts(int dpi = 96)
 {
     title_font = CreateFontW(-MulDiv(16, dpi, 96), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -281,8 +314,11 @@ void invalidate_simulation_ui(HWND window, bool toolbar)
         {
             const RECT molecule_button = molecule_tool_area(client_area);
             const RECT simulation_button = simulation_tool_area(client_area);
+            const RECT interaction_button =
+                interaction_tool_area(client_area);
             InvalidateRect(window, &molecule_button, FALSE);
             InvalidateRect(window, &simulation_button, FALSE);
+            InvalidateRect(window, &interaction_button, FALSE);
         }
 }
 
@@ -702,6 +738,31 @@ void draw_bonds()
     glLineWidth(1.0F);
 }
 
+void draw_interaction_force()
+{
+    if (!molecule_dragging ||
+        interacting_particle >= simulation_engine.particles().size())
+    {
+        return;
+    }
+    const simulation::Particle& particle =
+        simulation_engine.particles()[interacting_particle];
+    if (dot(particle.external_force, particle.external_force) < 1e-12)
+    {
+        return;
+    }
+    const Vec3 endpoint =
+        particle.position + particle.external_force * 0.05;
+    glDisable(GL_LIGHTING);
+    glLineWidth(3.0F);
+    glColor3ub(255, 174, 94);
+    glBegin(GL_LINES);
+    glVertex3d(particle.position.x, particle.position.y, particle.position.z);
+    glVertex3d(endpoint.x, endpoint.y, endpoint.z);
+    glEnd();
+    glLineWidth(1.0F);
+}
+
 void render_scene(const RECT& client_area)
 {
     const RECT area = scene_area(client_area);
@@ -747,6 +808,7 @@ void render_scene(const RECT& client_area)
     draw_simulation_boundaries();
     draw_bonds();
     draw_molecules(client_area);
+    draw_interaction_force();
 
     glDisable(GL_LIGHTING);
     glDisable(GL_DEPTH_TEST);
@@ -880,6 +942,28 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     draw_text(device_context, L"OPT", graphics_button, primary_text_color,
         button_font, DT_CENTER);
 
+    const RECT interaction_button = interaction_tool_area(client_area);
+    HPEN interaction_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH interaction_brush = CreateSolidBrush(
+        molecule_dragging ? RGB(26, 55, 61) : RGB(20, 27, 39));
+    HPEN previous_interaction_pen =
+        static_cast<HPEN>(SelectObject(device_context, interaction_pen));
+    HBRUSH previous_interaction_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, interaction_brush));
+    RoundRect(device_context, interaction_button.left, interaction_button.top,
+        interaction_button.right, interaction_button.bottom, 10, 10);
+    SelectObject(device_context, previous_interaction_brush);
+    SelectObject(device_context, previous_interaction_pen);
+    DeleteObject(interaction_brush);
+    DeleteObject(interaction_pen);
+    const wchar_t* interaction_label =
+        interaction_tool == InteractionTool::select ? L"SELECT" :
+        interaction_tool == InteractionTool::spring_drag ? L"SPRING" :
+        L"FORCE";
+    draw_text(device_context, interaction_label, interaction_button,
+        molecule_dragging ? x_axis_color : primary_text_color,
+        button_font, DT_CENTER);
+
     draw_text(device_context, L"X", RECT{654, toolbar.top + 16, 670, toolbar.top + 46},
         x_axis_color, status_font, DT_CENTER);
     draw_text(device_context, L"Y", RECT{678, toolbar.top + 16, 694, toolbar.top + 46},
@@ -887,7 +971,7 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     draw_text(device_context, L"Z", RECT{702, toolbar.top + 16, 718, toolbar.top + 46},
         z_axis_color, status_font, DT_CENTER);
 
-    if (scene_width(client_area) > 1050)
+    if (scene_width(client_area) > 1200)
     {
         wchar_t camera_label[48]{};
         std::swprintf(camera_label,
@@ -920,26 +1004,38 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     draw_line(device_context, client_area.left, footer.top,
         client_area.right, footer.top, border_color);
 
-    wchar_t fps_value[24]{};
     wchar_t molecule_value[24]{};
     wchar_t charge_value[24]{};
     wchar_t temperature_value[24]{};
-    wchar_t energy_value[24]{};
+    wchar_t pressure_value[24]{};
+    wchar_t density_value[24]{};
+    wchar_t kinetic_value[24]{};
+    wchar_t potential_value[24]{};
+    wchar_t total_energy_value[24]{};
+    wchar_t fps_value[24]{};
+    wchar_t steps_value[24]{};
     wchar_t frame_time_value[24]{};
     wchar_t camera_value[32]{};
     wchar_t uptime_value[24]{};
-    std::swprintf(fps_value, sizeof(fps_value) / sizeof(fps_value[0]),
-        L"%.0f", telemetry.frames_per_second);
+    const simulation::Metrics& metrics = simulation_engine.metrics();
     std::swprintf(molecule_value, sizeof(molecule_value) / sizeof(molecule_value[0]),
         L"%llu", static_cast<unsigned long long>(molecules.size()));
     if (selected_molecule_id > 0 &&
         selected_molecule_id <= simulation_engine.particles().size())
     {
-        const double selected_charge = simulation_engine.particles()[
-            static_cast<std::size_t>(selected_molecule_id - 1)].charge;
-        std::swprintf(charge_value,
-            sizeof(charge_value) / sizeof(charge_value[0]),
-            L"%+.1f", selected_charge);
+        const std::size_t selected_index =
+            static_cast<std::size_t>(selected_molecule_id - 1);
+        if (selected_index < simulation_engine.particles().size())
+        {
+            std::swprintf(charge_value,
+                sizeof(charge_value) / sizeof(charge_value[0]),
+                L"%+.1f", simulation_engine.particles()[selected_index].charge);
+        }
+        else
+        {
+            std::swprintf(charge_value,
+                sizeof(charge_value) / sizeof(charge_value[0]), L"—");
+        }
     }
     else
     {
@@ -948,10 +1044,36 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     }
     std::swprintf(temperature_value,
         sizeof(temperature_value) / sizeof(temperature_value[0]),
-        L"%.3f", simulation_engine.metrics().temperature);
-    std::swprintf(energy_value,
-        sizeof(energy_value) / sizeof(energy_value[0]),
-        L"%.3f", simulation_engine.metrics().potential_energy);
+        L"%.3f", metrics.temperature);
+    if (metrics.pressure_available)
+    {
+        std::swprintf(pressure_value,
+            sizeof(pressure_value) / sizeof(pressure_value[0]),
+            L"%.3f", metrics.pressure);
+        std::swprintf(density_value,
+            sizeof(density_value) / sizeof(density_value[0]),
+            L"%.3f", metrics.number_density);
+    }
+    else
+    {
+        std::swprintf(pressure_value,
+            sizeof(pressure_value) / sizeof(pressure_value[0]), L"—");
+        std::swprintf(density_value,
+            sizeof(density_value) / sizeof(density_value[0]), L"—");
+    }
+    std::swprintf(kinetic_value,
+        sizeof(kinetic_value) / sizeof(kinetic_value[0]),
+        L"%.3f", metrics.kinetic_energy);
+    std::swprintf(potential_value,
+        sizeof(potential_value) / sizeof(potential_value[0]),
+        L"%.3f", metrics.potential_energy);
+    std::swprintf(total_energy_value,
+        sizeof(total_energy_value) / sizeof(total_energy_value[0]),
+        L"%.3f", metrics.total_energy);
+    std::swprintf(fps_value, sizeof(fps_value) / sizeof(fps_value[0]),
+        L"%.0f", telemetry.frames_per_second);
+    std::swprintf(steps_value, sizeof(steps_value) / sizeof(steps_value[0]),
+        L"%.0f", telemetry.simulation_steps_per_second);
     if (telemetry.has_frame_sample)
     {
         std::swprintf(frame_time_value,
@@ -989,53 +1111,95 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         const wchar_t* label;
         const wchar_t* value;
     };
-    const Metric metrics[]{
-        {L"FPS", fps_value},
+    const Metric thermodynamic_metrics[]{
         {L"MOLECULES", molecule_value},
-        {L"STEPS / SEC", nullptr},
+        {L"TEMPERATURE", temperature_value},
+        {L"PRESSURE", pressure_value},
+        {L"NUMBER DENSITY", density_value},
+        {L"KINETIC ENERGY", kinetic_value},
+        {L"POTENTIAL ENERGY", potential_value},
+        {L"TOTAL ENERGY", total_energy_value}};
+    constexpr int thermodynamic_count = static_cast<int>(
+        sizeof(thermodynamic_metrics) / sizeof(thermodynamic_metrics[0]));
+    const int thermodynamic_width =
+        scene_width(client_area) / thermodynamic_count;
+    draw_text(device_context, L"THERMODYNAMICS",
+        RECT{16, footer.top + 3, client_area.right - 16, footer.top + 17},
+        muted_text_color, small_font);
+    for (int index = 0; index < thermodynamic_count; ++index)
+    {
+        const int left = client_area.left + index * thermodynamic_width;
+        const int right = index == thermodynamic_count - 1
+            ? client_area.right
+            : left + thermodynamic_width;
+        RECT label_area{left + 4, footer.top + 17, right - 4, footer.top + 31};
+        RECT value_area{left + 4, footer.top + 30, right - 4, footer.top + 48};
+        draw_text(device_context, thermodynamic_metrics[index].label, label_area,
+            muted_text_color, small_font, DT_CENTER);
+        draw_text(device_context, thermodynamic_metrics[index].value,
+            value_area, index == 1 ? x_axis_color : primary_text_color,
+            status_font, DT_CENTER);
+        if (index > 0)
+        {
+            draw_line(device_context, left, footer.top + 20,
+                left, footer.top + 45, border_color);
+        }
+    }
+
+    draw_line(device_context, client_area.left, footer.top + 50,
+        client_area.right, footer.top + 50, border_color);
+    draw_text(device_context, L"SIMULATION",
+        RECT{16, footer.top + 52, client_area.right - 16, footer.top + 66},
+        muted_text_color, small_font);
+    const Metric runtime_metrics[]{
+        {L"FPS", fps_value},
+        {L"STEPS / SEC", steps_value},
         {L"CHARGE", charge_value},
-        {L"TEMP", temperature_value},
-        {L"POTENTIAL", energy_value},
-        {L"PING", L"N/A"},
-        {L"FRAME", frame_time_value},
+        {L"FRAME TIME", frame_time_value},
         {L"CAMERA SPEED", camera_value},
         {L"UPTIME", uptime_value}};
-    constexpr int metric_count = static_cast<int>(sizeof(metrics) / sizeof(metrics[0]));
-    wchar_t simulation_steps_value[24]{};
-    std::swprintf(simulation_steps_value,
-        sizeof(simulation_steps_value) / sizeof(simulation_steps_value[0]),
-        L"%.0f", telemetry.simulation_steps_per_second);
-    const int column_width = scene_width(client_area) / metric_count;
-    for (int index = 0; index < metric_count; ++index)
+    constexpr int runtime_count = static_cast<int>(
+        sizeof(runtime_metrics) / sizeof(runtime_metrics[0]));
+    const int runtime_width = scene_width(client_area) / runtime_count;
+    for (int index = 0; index < runtime_count; ++index)
     {
-        const int left = client_area.left + index * column_width;
-        const int right = index == metric_count - 1
+        const int left = client_area.left + index * runtime_width;
+        const int right = index == runtime_count - 1
             ? client_area.right
-            : left + column_width;
-        RECT label_area{left + 4, footer.top + 4, right - 4, footer.top + 22};
-        RECT value_area{left + 4, footer.top + 23, right - 4, footer.top + 44};
-        draw_text(device_context, metrics[index].label, label_area,
+            : left + runtime_width;
+        RECT label_area{left + 4, footer.top + 66, right - 4, footer.top + 79};
+        RECT value_area{left + 4, footer.top + 78, right - 4, footer.top + 95};
+        draw_text(device_context, runtime_metrics[index].label, label_area,
             muted_text_color, small_font, DT_CENTER);
-        const wchar_t* metric_value = index == 2
-            ? simulation_steps_value
-            : metrics[index].value;
-        draw_text(device_context, metric_value, value_area,
+        draw_text(device_context, runtime_metrics[index].value, value_area,
             index == 0 ? x_axis_color : primary_text_color,
             status_font, DT_CENTER);
         if (index > 0)
         {
-            draw_line(device_context, left, footer.top + 10,
-                left, footer.top + 39, border_color);
+            draw_line(device_context, left, footer.top + 69,
+                left, footer.top + 92, border_color);
         }
     }
 
-    draw_line(device_context, client_area.left, footer.top + 47,
-        client_area.right, footer.top + 47, border_color);
-    RECT instructions{16, footer.top + 49, client_area.right - 390, footer.bottom - 1};
+    draw_line(device_context, client_area.left, footer.top + 97,
+        client_area.right, footer.top + 97, border_color);
+    RECT instructions{16, footer.top + 98,
+        client_area.right - 390, footer.bottom - 1};
     const wchar_t* hint = molecule_tool_active
         ? L"CLICK PLACE   SHIFT+WHEEL HEIGHT   ESC CANCEL"
         : bond_tool_active
         ? L"CLICK TWO MOLECULES TO BOND   ESC CANCEL"
+        : molecule_dragging &&
+            interaction_tool == InteractionTool::directional_force
+        ? L"DRAG TO SET FORCE VECTOR   RELEASE TO STOP"
+        : molecule_dragging
+        ? L"SPRING FORCE ACTIVE   RELEASE TO STOP"
+        : interaction_tool != InteractionTool::select && !simulation_running
+        ? L"START SIMULATION TO APPLY MOLECULE FORCES"
+        : interaction_tool == InteractionTool::directional_force
+        ? L"SELECT MOLECULE   HOLD+DRAG TO APPLY FORCE"
+        : interaction_tool == InteractionTool::spring_drag
+        ? L"SELECT MOLECULE   DRAG WITH SPRING FORCE"
         : L"WASD/QE MOVE   RMB ORBIT   MMB PAN   WHEEL ZOOM   SPACE SIM";
     draw_text(device_context, hint, instructions, muted_text_color, small_font);
 
@@ -1046,7 +1210,7 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         L"Y: %.2f", camera_state.target.y);
     std::swprintf(coordinates[2], sizeof(coordinates[2]) / sizeof(coordinates[2][0]),
         L"Z: %.2f", camera_state.target.z);
-    RECT status_area{client_area.right - 378, footer.top + 49,
+    RECT status_area{client_area.right - 378, footer.top + 98,
         client_area.right - 16, footer.bottom - 1};
     const int coordinate_width =
         (status_area.right - status_area.left) / 3;
@@ -1247,6 +1411,85 @@ void show_graphics_menu(HWND window)
     }
 }
 
+void set_interaction_tool(HWND window, InteractionTool tool)
+{
+    if (molecule_dragging)
+    {
+        const std::size_t active_index = interacting_particle;
+        molecule_dragging = false;
+        interacting_particle = static_cast<std::size_t>(-1);
+        if (active_index < simulation_engine.particles().size())
+        {
+            simulation_engine.set_external_force(active_index, Vec3{});
+        }
+        ReleaseCapture();
+    }
+    interaction_tool = tool;
+    molecule_tool_active = false;
+    bond_tool_active = false;
+    pending_bond_molecule_id = 0;
+    invalidate_simulation_ui(window, true);
+}
+
+void show_interaction_menu(HWND window)
+{
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
+    {
+        MessageBoxW(window, L"Unable to open molecule interaction tools.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    const bool menu_ready =
+        AppendMenuW(menu, MF_STRING |
+                (interaction_tool == InteractionTool::select ? MF_CHECKED : 0),
+            menu_interaction_select, L"Select molecule") &&
+        AppendMenuW(menu, MF_STRING |
+                (interaction_tool == InteractionTool::spring_drag
+                        ? MF_CHECKED : 0),
+            menu_interaction_spring_drag,
+            L"Spring drag (requires running simulation)") &&
+        AppendMenuW(menu, MF_STRING |
+                (interaction_tool == InteractionTool::directional_force
+                        ? MF_CHECKED : 0),
+            menu_interaction_directional_force,
+            L"Directional force (hold and drag)");
+    if (!menu_ready)
+    {
+        DestroyMenu(menu);
+        MessageBoxW(window, L"Unable to build the interaction tools menu.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT button = interaction_tool_area(client_area);
+    POINT menu_position{button.left, button.bottom};
+    ClientToScreen(window, &menu_position);
+    SetForegroundWindow(window);
+    const UINT command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        menu_position.x, menu_position.y, 0, window, nullptr);
+    DestroyMenu(menu);
+
+    switch (command)
+    {
+    case menu_interaction_select:
+        set_interaction_tool(window, InteractionTool::select);
+        break;
+    case menu_interaction_spring_drag:
+        set_interaction_tool(window, InteractionTool::spring_drag);
+        break;
+    case menu_interaction_directional_force:
+        set_interaction_tool(window, InteractionTool::directional_force);
+        break;
+    default:
+        break;
+    }
+}
+
 bool is_key_down(int key)
 {
     return (GetAsyncKeyState(key) & 0x8000) != 0;
@@ -1330,6 +1573,84 @@ void set_simulation_running(HWND window, bool running)
     invalidate_simulation_ui(window, true);
 }
 
+Vec3 limit_interaction_force(Vec3 force)
+{
+    const double magnitude_squared = dot(force, force);
+    const double maximum_squared =
+        maximum_interaction_force * maximum_interaction_force;
+    if (magnitude_squared > maximum_squared)
+    {
+        return force * (maximum_interaction_force /
+            std::sqrt(magnitude_squared));
+    }
+    return force;
+}
+
+bool update_interaction_force(HWND window)
+{
+    if (!molecule_dragging ||
+        interacting_particle >= simulation_engine.particles().size())
+    {
+        return true;
+    }
+
+    const auto& particle =
+        simulation_engine.particles()[interacting_particle];
+    Vec3 force{};
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    if (interaction_tool == InteractionTool::spring_drag)
+    {
+        Vec3 cursor_position{};
+        if (screen_to_plane(client_area, pointer_position,
+                particle.position.z, cursor_position))
+        {
+            const Vec3 target = cursor_position + molecule_drag_offset;
+            const Vec3 displacement = target - particle.position;
+            const double damping =
+                2.0 * std::sqrt(spring_drag_stiffness * particle.mass);
+            force = displacement * spring_drag_stiffness -
+                particle.velocity * damping;
+        }
+    }
+    else if (interaction_tool == InteractionTool::directional_force)
+    {
+        Vec3 start_position{};
+        Vec3 current_position{};
+        if (screen_to_plane(client_area, force_drag_start_position,
+                particle.position.z, start_position) &&
+            screen_to_plane(client_area, pointer_position,
+                particle.position.z, current_position))
+        {
+            force = (current_position - start_position) *
+                directional_force_scale;
+        }
+    }
+
+    force = limit_interaction_force(force);
+    if (!simulation_engine.set_external_force(interacting_particle, force))
+    {
+        MessageBoxW(window, L"Unable to apply the interaction force.",
+            L"Simulation error", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    return true;
+}
+
+void stop_molecule_interaction(HWND window)
+{
+    const std::size_t active_index = interacting_particle;
+    molecule_dragging = false;
+    interacting_particle = static_cast<std::size_t>(-1);
+    if (active_index < simulation_engine.particles().size() &&
+        !simulation_engine.set_external_force(active_index, Vec3{}))
+    {
+        MessageBoxW(window, L"Unable to release the applied molecule force.",
+            L"Simulation error", MB_OK | MB_ICONERROR);
+    }
+    invalidate_simulation_ui(window, true);
+}
+
 void update_simulation(HWND window)
 {
     const ULONGLONG now = GetTickCount64();
@@ -1343,6 +1664,12 @@ void update_simulation(HWND window)
 
     unsigned int completed_steps = 0;
     std::string error;
+    if (molecule_dragging && !update_interaction_force(window))
+    {
+        set_simulation_running(window, false);
+        stop_molecule_interaction(window);
+        return;
+    }
     while (simulation_time_accumulator >= time_step &&
         completed_steps < maximum_catch_up_steps)
     {
@@ -1523,14 +1850,13 @@ void place_molecule(HWND window, POINT position)
         return;
     }
     selected_molecule_id = id;
-    molecule_dragging = true;
-    molecule_drag_offset = Vec3{};
-    SetCapture(window);
 }
 
-bool begin_molecule_drag(const RECT& client_area, POINT screen)
+bool begin_molecule_interaction(
+    HWND window, const RECT& client_area, POINT screen)
 {
     molecule_dragging = false;
+    interacting_particle = static_cast<std::size_t>(-1);
     Molecule* molecule = pick_molecule(client_area, screen);
     if (molecule == nullptr)
     {
@@ -1539,10 +1865,26 @@ bool begin_molecule_drag(const RECT& client_area, POINT screen)
     }
 
     selected_molecule_id = molecule->id;
+    if (interaction_tool == InteractionTool::select ||
+        !simulation_running)
+    {
+        return true;
+    }
     Vec3 cursor_position{};
     if (screen_to_plane(client_area, screen, molecule->position.z, cursor_position))
     {
+        interacting_particle =
+            static_cast<std::size_t>(molecule->id - 1);
+        if (interacting_particle >= simulation_engine.particles().size())
+        {
+            interacting_particle = static_cast<std::size_t>(-1);
+            MessageBoxW(window,
+                L"The selected molecule has no simulation particle.",
+                L"Simulation error", MB_OK | MB_ICONERROR);
+            return true;
+        }
         molecule_drag_offset = molecule->position - cursor_position;
+        force_drag_start_position = screen;
         molecule_dragging = true;
     }
     return true;
@@ -1936,29 +2278,6 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         }
         else if (molecule_dragging)
         {
-            for (Molecule& molecule : molecules)
-            {
-                if (molecule.id != selected_molecule_id)
-                {
-                    continue;
-                }
-                Vec3 cursor_position{};
-                if (screen_to_plane(client_area, position, molecule.position.z,
-                        cursor_position))
-                {
-                    molecule.position = cursor_position + molecule_drag_offset;
-                    const std::size_t particle_index =
-                        static_cast<std::size_t>(molecule.id - 1);
-                    if (!simulation_engine.set_position(
-                            particle_index, molecule.position) ||
-                        !simulation_engine.set_velocity(
-                            particle_index, Vec3{}))
-                    {
-                        set_simulation_running(window, false);
-                    }
-                }
-                break;
-            }
             InvalidateRect(window, &area, FALSE);
         }
 
@@ -2005,7 +2324,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
     if (message == WM_LBUTTONUP && molecule_dragging)
     {
-        molecule_dragging = false;
+        stop_molecule_interaction(window);
         ReleaseCapture();
         return 0;
     }
@@ -2038,7 +2357,10 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     {
         orbit_dragging = false;
         pan_dragging = false;
-        molecule_dragging = false;
+        if (molecule_dragging)
+        {
+            stop_molecule_interaction(window);
+        }
     }
 
     if (message == WM_LBUTTONDOWN)
@@ -2051,6 +2373,14 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         const RECT button_area = molecule_tool_area(client_area);
         const RECT simulation_button = simulation_tool_area(client_area);
         const RECT graphics_button = graphics_tool_area(client_area);
+        const RECT interaction_button =
+            interaction_tool_area(client_area);
+        if (PtInRect(&interaction_button, position))
+        {
+            SetFocus(window);
+            show_interaction_menu(window);
+            return 0;
+        }
         if (PtInRect(&graphics_button, position))
         {
             SetFocus(window);
@@ -2083,14 +2413,10 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         }
         if (PtInRect(&area, position))
         {
-            if (begin_molecule_drag(client_area, position))
+            if (begin_molecule_interaction(window, client_area, position))
             {
                 if (molecule_dragging)
                 {
-                    if (simulation_running)
-                    {
-                        set_simulation_running(window, false);
-                    }
                     SetCapture(window);
                 }
                 invalidate_simulation_ui(window, false);
@@ -2205,13 +2531,17 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         stop_camera_motion(window);
         orbit_dragging = false;
         pan_dragging = false;
+        if (molecule_dragging)
+        {
+            stop_molecule_interaction(window);
+        }
         ReleaseCapture();
     }
 
     if (message == WM_GETMINMAXINFO)
     {
         auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
-        limits->ptMinTrackSize.x = 800;
+        limits->ptMinTrackSize.x = 960;
         limits->ptMinTrackSize.y = 540;
         return 0;
     }

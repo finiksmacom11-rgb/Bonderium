@@ -101,6 +101,27 @@ void test_harmonic_bond()
     assert(engine.metrics().potential_energy > 0.0);
 }
 
+void test_external_force_changes_velocity_without_teleporting()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle = engine.add_particle({1.0, 2.0, 3.0});
+    set_neutral_lj(engine, particle);
+    assert(engine.set_external_force(particle, {4.0, 0.0, 0.0}));
+
+    std::string error;
+    assert(engine.step(error));
+    const simulation::Particle& accelerated = engine.particles()[particle];
+    assert(near(accelerated.position.x, 1.0002));
+    assert(near(accelerated.position.y, 2.0));
+    assert(near(accelerated.position.z, 3.0));
+    assert(near(accelerated.velocity.x, 0.04));
+
+    assert(engine.set_external_force(particle, {}));
+    assert(engine.step(error));
+    assert(near(engine.particles()[particle].velocity.x, 0.04));
+}
+
 void test_harmonic_angle()
 {
     simulation::Engine engine;
@@ -173,6 +194,50 @@ void test_force_cache_tracks_config_changes()
     engine.config().gravity_z = -1.0;
     assert(engine.step(error));
     assert(engine.particles()[particle].velocity.z < 0.0);
+}
+
+void test_thermodynamic_metrics_for_confined_gas()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.001;
+    engine.config().boundary_mode = simulation::BoundaryMode::reflective;
+    engine.config().boundary_min = -1.0;
+    engine.config().boundary_max = 1.0;
+    const std::size_t particle = engine.add_particle({0.0, 0.0, 0.0});
+    assert(engine.set_velocity(particle, {2.0, 0.0, 0.0}));
+
+    std::string error;
+    assert(engine.step(error));
+    const simulation::Metrics& metrics = engine.metrics();
+    assert(near(metrics.kinetic_energy, 2.0));
+    assert(near(metrics.potential_energy, 0.0));
+    assert(near(metrics.total_energy, 2.0));
+    assert(near(metrics.temperature, 4.0 / 3.0));
+    assert(metrics.pressure_available);
+    assert(near(metrics.pressure, 1.0 / 6.0));
+    assert(near(metrics.number_density, 1.0 / 8.0));
+
+    engine.config().boundary_mode = simulation::BoundaryMode::none;
+    assert(engine.step(error));
+    assert(!engine.metrics().pressure_available);
+}
+
+void test_virial_pressure_includes_lennard_jones_interactions()
+{
+    simulation::Engine engine;
+    engine.config().cutoff = 2.0;
+    engine.config().boundary_mode = simulation::BoundaryMode::reflective;
+    engine.config().boundary_min = -5.0;
+    engine.config().boundary_max = 5.0;
+    const std::size_t first = engine.add_particle({0.0, 0.0, 0.0});
+    const std::size_t second = engine.add_particle({1.0, 0.0, 0.0});
+    assert(engine.set_particle_properties(first, 1.0, 0.0, 1.0, 1.0, true));
+    assert(engine.set_particle_properties(second, 1.0, 0.0, 1.0, 1.0, true));
+
+    std::string error;
+    assert(engine.step(error));
+    assert(near(engine.metrics().configurational_virial, 24.0));
+    assert(near(engine.metrics().pressure, 24.0 / 3000.0));
 }
 
 void test_soft_wall_force_and_overlapping_particle_error()
@@ -261,10 +326,13 @@ int main()
     test_coulomb_force_and_energy();
     test_neighbor_cache_and_invalidation();
     test_harmonic_bond();
+    test_external_force_changes_velocity_without_teleporting();
     test_harmonic_angle();
     test_angle_force_matches_energy_gradient();
     test_bond_creation_adds_shared_harmonic_angle();
     test_force_cache_tracks_config_changes();
+    test_thermodynamic_metrics_for_confined_gas();
+    test_virial_pressure_includes_lennard_jones_interactions();
     test_soft_wall_force_and_overlapping_particle_error();
     test_reflective_boundary_and_thermostat_modes();
     test_barnes_hut_coulomb_path();
