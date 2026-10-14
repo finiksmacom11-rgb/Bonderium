@@ -25,10 +25,17 @@ constexpr int simulation_tool_left = 420;
 constexpr int simulation_tool_width = 126;
 constexpr int simulation_tool_top = 14;
 constexpr int simulation_tool_height = 34;
-constexpr int graphics_tool_left = 724;
-constexpr int graphics_tool_width = 60;
+constexpr int graphics_tool_left = 554;
+constexpr int graphics_tool_width = 76;
 constexpr int graphics_tool_top = 14;
 constexpr int graphics_tool_height = 34;
+constexpr int atom_type_tool_left = 638;
+constexpr int atom_type_tool_width = 100;
+constexpr int atom_type_picker_width = 154;
+constexpr int atom_type_picker_height = 56;
+constexpr int atom_type_key_size = 38;
+constexpr int atom_type_key_gap = 8;
+constexpr int atom_type_key_padding = 8;
 constexpr UINT_PTR camera_timer_id = 1;
 constexpr UINT_PTR telemetry_timer_id = 2;
 constexpr UINT_PTR simulation_timer_id = 3;
@@ -43,9 +50,7 @@ constexpr double camera_zoom_factor = 1.15;
 constexpr double camera_move_speed = 12.0;
 constexpr double camera_ease_seconds = 0.12;
 constexpr double camera_stop_threshold = 0.015;
-constexpr double molecule_radius = 0.42;
-constexpr double molecule_sigma = 0.75;
-constexpr double molecule_epsilon = 0.1;
+constexpr double minimum_placement_height = 0.1;
 constexpr double field_of_view = 45.0;
 constexpr double pi = 3.14159265358979323846;
 
@@ -75,7 +80,59 @@ enum GraphicsMenuCommand : UINT
     menu_toggle_grid
 };
 
+enum class AtomType
+{
+    oxygen,
+    hydrogen,
+    yureum
+};
+
 using simulation::Vec3;
+
+struct AtomProperties
+{
+    const wchar_t* label;
+    double radius;
+    double mass;
+    double charge;
+    double sigma;
+    double epsilon;
+    COLORREF color;
+};
+
+constexpr AtomProperties oxygen_properties{
+    L"OXYGEN (O)", 0.60, 15.999, -0.834, 0.75, 0.15, RGB(235, 76, 63)};
+constexpr AtomProperties hydrogen_properties{
+    L"HYDROGEN (H)", 0.32, 1.008, 0.417, 0.25, 0.02, RGB(225, 236, 247)};
+constexpr AtomProperties yureum_properties{
+    L"YUREUM (Ю)", 0.42, 1.0, 0.0, 0.75, 0.10, RGB(69, 214, 201)};
+
+const AtomProperties& atom_properties(AtomType type)
+{
+    if (type == AtomType::oxygen)
+    {
+        return oxygen_properties;
+    }
+    if (type == AtomType::hydrogen)
+    {
+        return hydrogen_properties;
+    }
+    return yureum_properties;
+}
+
+const wchar_t* atom_symbol(AtomType type)
+{
+    switch (type)
+    {
+    case AtomType::oxygen:
+        return L"O";
+    case AtomType::hydrogen:
+        return L"H";
+    case AtomType::yureum:
+        return L"Ю";
+    }
+    return L"";
+}
 
 struct CameraState
 {
@@ -92,6 +149,7 @@ struct Molecule
     std::uint64_t id;
     Vec3 position;
     double radius;
+    AtomType type;
 };
 
 struct Telemetry
@@ -134,20 +192,27 @@ WINDOWPLACEMENT windowed_placement{};
 LONG_PTR windowed_style = 0;
 LONG_PTR windowed_extended_style = 0;
 bool molecule_tool_active = false;
+AtomType selected_atom_type = AtomType::oxygen;
+bool atom_type_picker_open = false;
 bool bond_tool_active = false;
 std::uint64_t pending_bond_molecule_id = 0;
 bool simulation_running = false;
 double simulation_time_accumulator = 0.0;
 ULONGLONG last_simulation_tick = 0;
-double molecule_placement_height = molecule_radius;
+double molecule_placement_height = oxygen_properties.radius;
 bool pointer_over_scene = false;
 bool orbit_dragging = false;
 bool pan_dragging = false;
 bool molecule_dragging = false;
+bool force_tool_armed = false;
+bool force_dragging = false;
 std::uint64_t selected_molecule_id = 0;
+std::uint64_t force_drag_molecule_id = 0;
 Vec3 molecule_drag_offset{};
 POINT pointer_position{};
 POINT drag_last_position{};
+POINT force_drag_start{};
+POINT force_drag_end{};
 
 Vec3 operator+(Vec3 left, Vec3 right)
 {
@@ -225,6 +290,35 @@ RECT graphics_tool_area(const RECT& client_area)
         client_area.top + graphics_tool_top + graphics_tool_height};
 }
 
+RECT atom_type_tool_area(const RECT& client_area)
+{
+    return RECT{
+        client_area.left + atom_type_tool_left,
+        client_area.top + graphics_tool_top,
+        client_area.left + atom_type_tool_left + atom_type_tool_width,
+        client_area.top + graphics_tool_top + graphics_tool_height};
+}
+
+RECT atom_type_picker_area(const RECT& client_area)
+{
+    const RECT button = atom_type_tool_area(client_area);
+    return RECT{
+        button.left,
+        button.bottom + 6,
+        button.left + atom_type_picker_width,
+        button.bottom + 6 + atom_type_picker_height};
+}
+
+RECT atom_type_key_area(const RECT& client_area, int key_index)
+{
+    const RECT picker = atom_type_picker_area(client_area);
+    const int left = picker.left + atom_type_key_padding +
+        key_index * (atom_type_key_size + atom_type_key_gap);
+    const int top = picker.top +
+        (atom_type_picker_height - atom_type_key_size) / 2;
+    return RECT{left, top, left + atom_type_key_size, top + atom_type_key_size};
+}
+
 bool create_overlay_fonts(int dpi = 96)
 {
     title_font = CreateFontW(-MulDiv(16, dpi, 96), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
@@ -284,6 +378,12 @@ void invalidate_simulation_ui(HWND window, bool toolbar)
             InvalidateRect(window, &molecule_button, FALSE);
             InvalidateRect(window, &simulation_button, FALSE);
         }
+}
+
+void invalidate_scene_and_overlays(HWND window)
+{
+    // Keep the GDI-drawn panels in the same repaint cycle as the OpenGL scene.
+    InvalidateRect(window, nullptr, FALSE);
 }
 
 void fill_rectangle(HDC device_context, const RECT& area, COLORREF color)
@@ -583,8 +683,8 @@ void draw_simulation_boundaries()
     glLineWidth(1.0F);
 }
 
-void draw_sphere(const Vec3& center, double radius, bool preview = false,
-    bool selected = false, double charge = 0.0)
+void draw_sphere(const Vec3& center, double radius, AtomType type,
+    bool preview = false, bool selected = false)
 {
     int latitude_steps = 12;
     int longitude_steps = 18;
@@ -603,20 +703,23 @@ void draw_sphere(const Vec3& center, double radius, bool preview = false,
         glDisable(GL_LIGHTING);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glColor4ub(69, 214, 201, 90);
+        const COLORREF color = atom_properties(type).color;
+        glColor4ub(GetRValue(color), GetGValue(color), GetBValue(color), 110);
     }
     else
     {
         glEnable(GL_LIGHTING);
+        const COLORREF color = atom_properties(type).color;
         if (selected)
         {
-            glColor3ub(116, 204, 188);
+            glColor3ub(
+                static_cast<GLubyte>(GetRValue(color) * 0.7 + 69 * 0.3),
+                static_cast<GLubyte>(GetGValue(color) * 0.7 + 214 * 0.3),
+                static_cast<GLubyte>(GetBValue(color) * 0.7 + 201 * 0.3));
         }
         else
         {
-            glColor3ub(charge > 0.0 ? 225 : charge < 0.0 ? 151 : 69,
-                charge < 0.0 ? 132 : 154,
-                charge > 0.0 ? 110 : charge < 0.0 ? 232 : 160);
+            glColor3ub(GetRValue(color), GetGValue(color), GetBValue(color));
         }
     }
 
@@ -660,14 +763,8 @@ void draw_molecules(const RECT& client_area)
         {
             continue;
         }
-        const std::size_t particle_index =
-            static_cast<std::size_t>(molecule.id - 1);
-        const double charge =
-            particle_index < simulation_engine.particles().size()
-            ? simulation_engine.particles()[particle_index].charge
-            : 0.0;
-        draw_sphere(molecule.position, molecule.radius,
-            false, molecule.id == selected_molecule_id, charge);
+        draw_sphere(molecule.position, molecule.radius, molecule.type,
+            false, molecule.id == selected_molecule_id);
     }
 
     Vec3 preview_position{};
@@ -675,9 +772,10 @@ void draw_molecules(const RECT& client_area)
         screen_to_plane(client_area, pointer_position,
             molecule_placement_height, preview_position))
     {
+        const AtomProperties& properties = atom_properties(selected_atom_type);
         draw_sphere(
             Vec3{preview_position.x, preview_position.y, molecule_placement_height},
-            molecule_radius, true);
+            properties.radius, selected_atom_type, true);
     }
 }
 
@@ -698,6 +796,64 @@ void draw_bonds()
         glVertex3d(first.x, first.y, first.z);
         glVertex3d(second.x, second.y, second.z);
     }
+    glEnd();
+    glLineWidth(1.0F);
+}
+
+void draw_force_vector(const RECT& client_area)
+{
+    if (!force_dragging || force_drag_molecule_id == 0 ||
+        force_drag_molecule_id > molecules.size())
+    {
+        return;
+    }
+
+    const Molecule& molecule =
+        molecules[static_cast<std::size_t>(force_drag_molecule_id - 1)];
+    Vec3 drag_start{};
+    Vec3 drag_end{};
+    if (!screen_to_plane(client_area, force_drag_start, molecule.position.z,
+            drag_start) ||
+        !screen_to_plane(client_area, force_drag_end, molecule.position.z,
+            drag_end))
+    {
+        return;
+    }
+
+    Vec3 direction = drag_end - drag_start;
+    const double distance = std::sqrt(dot(direction, direction));
+    if (distance < 1e-6)
+    {
+        return;
+    }
+    constexpr double maximum_force_vector_length = 8.0;
+    if (distance > maximum_force_vector_length)
+    {
+        direction = direction * (maximum_force_vector_length / distance);
+    }
+    const double vector_length = std::sqrt(dot(direction, direction));
+    const Vec3 endpoint = molecule.position + direction;
+    const Vec3 unit{direction.x / vector_length,
+        direction.y / vector_length, 0.0};
+    const Vec3 perpendicular{-unit.y, unit.x, 0.0};
+    const double arrow_head_length = (std::min)(0.8, vector_length * 0.3);
+    const Vec3 arrow_base = endpoint - unit * arrow_head_length;
+    const Vec3 arrow_side = perpendicular * (arrow_head_length * 0.45);
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_DEPTH_TEST);
+    glLineWidth(3.0F);
+    glColor3ub(255, 174, 94);
+    glBegin(GL_LINES);
+    glVertex3d(molecule.position.x, molecule.position.y,
+        molecule.position.z + 0.04);
+    glVertex3d(endpoint.x, endpoint.y, endpoint.z + 0.04);
+    glVertex3d(endpoint.x, endpoint.y, endpoint.z + 0.04);
+    glVertex3d(arrow_base.x + arrow_side.x, arrow_base.y + arrow_side.y,
+        arrow_base.z + 0.04);
+    glVertex3d(endpoint.x, endpoint.y, endpoint.z + 0.04);
+    glVertex3d(arrow_base.x - arrow_side.x, arrow_base.y - arrow_side.y,
+        arrow_base.z + 0.04);
     glEnd();
     glLineWidth(1.0F);
 }
@@ -747,6 +903,7 @@ void render_scene(const RECT& client_area)
     draw_simulation_boundaries();
     draw_bonds();
     draw_molecules(client_area);
+    draw_force_vector(client_area);
 
     glDisable(GL_LIGHTING);
     glDisable(GL_DEPTH_TEST);
@@ -834,35 +991,24 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         simulation_running ? x_axis_color : primary_text_color,
         button_font, DT_CENTER);
 
-    const auto& config = simulation_engine.config();
-    const wchar_t* thermostat_label = L"OFF";
-    switch (config.thermostat)
-    {
-    case simulation::Thermostat::andersen:
-        thermostat_label = L"AND";
-        break;
-    case simulation::Thermostat::berendsen:
-        thermostat_label = L"BER";
-        break;
-    case simulation::Thermostat::acceleration_damping:
-        thermostat_label = L"DAMP";
-        break;
-    case simulation::Thermostat::none:
-        break;
-    }
-    wchar_t model_label[48]{};
-    std::swprintf(model_label, sizeof(model_label) / sizeof(model_label[0]),
-        L"%ls  %ls  %ls  %.2f",
-        config.integrator == simulation::Integrator::velocity_verlet
-            ? L"VV" : L"KDK",
-        thermostat_label,
-        config.coulomb_solver == simulation::CoulombSolver::direct
-            ? L"COUL" : L"TREE",
-        config.target_temperature);
-    draw_text(device_context, model_label,
-        RECT{client_area.left + 554, toolbar.top + 16,
-            client_area.left + 648, toolbar.top + 46},
-        muted_text_color, small_font, DT_CENTER);
+    const RECT atom_type_button = atom_type_tool_area(client_area);
+    const COLORREF atom_type_color = atom_properties(selected_atom_type).color;
+    HPEN atom_type_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH atom_type_brush = CreateSolidBrush(RGB(20, 27, 39));
+    HPEN previous_atom_type_pen =
+        static_cast<HPEN>(SelectObject(device_context, atom_type_pen));
+    HBRUSH previous_atom_type_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, atom_type_brush));
+    RoundRect(device_context, atom_type_button.left, atom_type_button.top,
+        atom_type_button.right, atom_type_button.bottom, 10, 10);
+    SelectObject(device_context, previous_atom_type_brush);
+    SelectObject(device_context, previous_atom_type_pen);
+    DeleteObject(atom_type_brush);
+    DeleteObject(atom_type_pen);
+    RECT atom_type_label{atom_type_button.left + 4, atom_type_button.top + 1,
+        atom_type_button.right - 4, atom_type_button.bottom - 1};
+    draw_text(device_context, atom_symbol(selected_atom_type),
+        atom_type_label, atom_type_color, small_font, DT_CENTER);
 
     const RECT graphics_button = graphics_tool_area(client_area);
     HPEN graphics_pen = CreatePen(PS_SOLID, 1, border_color);
@@ -877,15 +1023,8 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     SelectObject(device_context, previous_graphics_pen);
     DeleteObject(graphics_brush);
     DeleteObject(graphics_pen);
-    draw_text(device_context, L"OPT", graphics_button, primary_text_color,
+    draw_text(device_context, L"SETTINGS", graphics_button, primary_text_color,
         button_font, DT_CENTER);
-
-    draw_text(device_context, L"X", RECT{654, toolbar.top + 16, 670, toolbar.top + 46},
-        x_axis_color, status_font, DT_CENTER);
-    draw_text(device_context, L"Y", RECT{678, toolbar.top + 16, 694, toolbar.top + 46},
-        y_axis_color, status_font, DT_CENTER);
-    draw_text(device_context, L"Z", RECT{702, toolbar.top + 16, 718, toolbar.top + 46},
-        z_axis_color, status_font, DT_CENTER);
 
     if (scene_width(client_area) > 1050)
     {
@@ -909,6 +1048,55 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     }
     draw_filled_circle(device_context, client_area.right - 42,
         brand_center_y, 5, RGB(22, 53, 64), x_axis_color);
+}
+
+void draw_atom_type_picker(HDC device_context, const RECT& client_area,
+    HFONT button_font)
+{
+    if (!atom_type_picker_open)
+    {
+        return;
+    }
+
+    const RECT picker = atom_type_picker_area(client_area);
+    HPEN panel_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH panel_brush = CreateSolidBrush(RGB(15, 20, 30));
+    HPEN previous_pen = static_cast<HPEN>(SelectObject(device_context, panel_pen));
+    HBRUSH previous_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, panel_brush));
+    RoundRect(device_context, picker.left, picker.top,
+        picker.right, picker.bottom, 12, 12);
+    SelectObject(device_context, previous_brush);
+    SelectObject(device_context, previous_pen);
+    DeleteObject(panel_brush);
+    DeleteObject(panel_pen);
+
+    const AtomType types[]{
+        AtomType::oxygen, AtomType::hydrogen, AtomType::yureum};
+    for (int index = 0; index < 3; ++index)
+    {
+        const RECT key = atom_type_key_area(client_area, index);
+        const bool selected = selected_atom_type == types[index];
+        const COLORREF accent = atom_properties(types[index]).color;
+        const COLORREF fill = selected
+            ? RGB(26, 45, 53)
+            : RGB(20, 27, 39);
+        HPEN key_pen = CreatePen(PS_SOLID, selected ? 2 : 1,
+            selected ? accent : border_color);
+        HBRUSH key_brush = CreateSolidBrush(fill);
+        HPEN previous_key_pen =
+            static_cast<HPEN>(SelectObject(device_context, key_pen));
+        HBRUSH previous_key_brush =
+            static_cast<HBRUSH>(SelectObject(device_context, key_brush));
+        RoundRect(device_context, key.left, key.top,
+            key.right, key.bottom, 8, 8);
+        SelectObject(device_context, previous_key_brush);
+        SelectObject(device_context, previous_key_pen);
+        DeleteObject(key_brush);
+        DeleteObject(key_pen);
+        draw_text(device_context, atom_symbol(types[index]), key,
+            selected ? accent : primary_text_color, button_font, DT_CENTER);
+    }
 }
 
 void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
@@ -1072,6 +1260,19 @@ void draw_overlay(HDC device_context, const RECT& client_area)
         draw_toolbar(device_context, client_area, title_font, small_font,
             button_font, status_font);
         draw_footer(device_context, client_area, small_font, status_font);
+        draw_atom_type_picker(device_context, client_area, button_font);
+        if (force_tool_armed)
+        {
+            RECT prompt_area{
+                client_area.left + 16,
+                client_area.top + toolbar_height + 8,
+                client_area.left + 430,
+                client_area.top + toolbar_height + 32};
+            fill_rectangle(device_context, prompt_area, RGB(15, 20, 30));
+            draw_text(device_context,
+                L"F: потяните мышью от выбранного атома; Esc — отмена",
+                prompt_area, x_axis_color, small_font);
+        }
     }
 }
 
@@ -1268,6 +1469,7 @@ void stop_camera_motion(HWND window)
 void set_molecule_tool(HWND window, bool active)
 {
     molecule_tool_active = active;
+    force_tool_armed = false;
     bond_tool_active = false;
     pending_bond_molecule_id = 0;
     pointer_over_scene = false;
@@ -1296,6 +1498,7 @@ void set_molecule_tool(HWND window, bool active)
 void set_bond_tool(HWND window, bool active)
 {
     bond_tool_active = active;
+    force_tool_armed = false;
     pending_bond_molecule_id = 0;
     molecule_tool_active = false;
     pointer_over_scene = false;
@@ -1366,10 +1569,7 @@ void update_simulation(HWND window)
         molecules[index].position = particles[index].position;
     }
 
-    RECT client_area{};
-    GetClientRect(window, &client_area);
-    const RECT area = scene_area(client_area);
-    InvalidateRect(window, &area, FALSE);
+    invalidate_scene_and_overlays(window);
 }
 
 void adjust_selected_charge(HWND window, double delta)
@@ -1392,6 +1592,83 @@ void adjust_selected_charge(HWND window, double delta)
         return;
     }
     invalidate_simulation_ui(window, true);
+}
+
+void toggle_force_tool(HWND window)
+{
+    if (force_dragging)
+    {
+        return;
+    }
+    if (force_tool_armed)
+    {
+        force_tool_armed = false;
+        invalidate_scene_and_overlays(window);
+        return;
+    }
+    if (selected_molecule_id == 0 ||
+        selected_molecule_id > molecules.size() ||
+        selected_molecule_id > simulation_engine.particles().size())
+    {
+        MessageBoxW(window, L"Сначала выберите атом, которому нужно придать импульс.",
+            L"Нет выбранного атома", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    if (molecule_tool_active || bond_tool_active)
+    {
+        set_molecule_tool(window, false);
+    }
+    force_tool_armed = true;
+    invalidate_scene_and_overlays(window);
+}
+
+void launch_force_drag(HWND window)
+{
+    if (force_drag_molecule_id == 0 ||
+        force_drag_molecule_id > molecules.size() ||
+        force_drag_molecule_id > simulation_engine.particles().size())
+    {
+        return;
+    }
+
+    const std::size_t particle_index =
+        static_cast<std::size_t>(force_drag_molecule_id - 1);
+    const Molecule& molecule = molecules[particle_index];
+    Vec3 drag_start{};
+    Vec3 drag_end{};
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    if (!screen_to_plane(client_area, force_drag_start, molecule.position.z,
+            drag_start) ||
+        !screen_to_plane(client_area, force_drag_end, molecule.position.z,
+            drag_end))
+    {
+        return;
+    }
+
+    Vec3 impulse = drag_end - drag_start;
+    const double distance = std::sqrt(dot(impulse, impulse));
+    constexpr double minimum_drag_length = 0.1;
+    constexpr double maximum_force_vector_length = 8.0;
+    constexpr double impulse_per_world_unit = 2.0;
+    if (distance < minimum_drag_length)
+    {
+        return;
+    }
+    if (distance > maximum_force_vector_length)
+    {
+        impulse = impulse * (maximum_force_vector_length / distance);
+    }
+
+    const Vec3 velocity =
+        simulation_engine.particles()[particle_index].velocity;
+    if (!simulation_engine.set_velocity(particle_index,
+            velocity + impulse * impulse_per_world_unit))
+    {
+        MessageBoxW(window, L"Не удалось приложить импульс к выбранному атому.",
+            L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+    }
 }
 
 void adjust_target_temperature(HWND window, double delta)
@@ -1501,6 +1778,22 @@ void reset_view(HWND window)
 
 void place_molecule(HWND window, POINT position)
 {
+    if (selected_atom_type == AtomType::hydrogen)
+    {
+        const std::size_t oxygen_count = static_cast<std::size_t>(
+            std::count_if(molecules.begin(), molecules.end(),
+                [](const Molecule& molecule) {
+                    return molecule.type == AtomType::oxygen;
+                }));
+        if (oxygen_count < 1)
+        {
+            MessageBoxW(window,
+                L"Сначала добавьте один атом кислорода. После этого можно создавать атомы водорода.",
+                L"Сначала добавьте кислород", MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
     RECT client_area{};
     GetClientRect(window, &client_area);
     Vec3 world_position{};
@@ -1509,12 +1802,15 @@ void place_molecule(HWND window, POINT position)
     {
         return;
     }
+    const AtomProperties& properties = atom_properties(selected_atom_type);
     const std::uint64_t id = next_molecule_id++;
-    molecules.push_back(Molecule{id, world_position, molecule_radius});
+    molecules.push_back(Molecule{
+        id, world_position, properties.radius, selected_atom_type});
     const std::size_t particle_index =
         simulation_engine.add_particle(world_position);
-    if (!simulation_engine.set_particle_properties(particle_index, 1.0, 0.0,
-            molecule_sigma, molecule_epsilon, false))
+    if (!simulation_engine.set_particle_properties(particle_index,
+            properties.mass, properties.charge, properties.sigma,
+            properties.epsilon, false))
     {
         molecules.pop_back();
         --next_molecule_id;
@@ -1763,9 +2059,23 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             toggle_fullscreen(window);
             return 0;
         }
-        if (w_param == VK_ESCAPE && (molecule_tool_active || bond_tool_active))
+        if (w_param == VK_ESCAPE &&
+            (molecule_tool_active || bond_tool_active ||
+                force_tool_armed || force_dragging || atom_type_picker_open))
         {
-            set_molecule_tool(window, false);
+            force_tool_armed = false;
+            force_dragging = false;
+            force_drag_molecule_id = 0;
+            atom_type_picker_open = false;
+            if (GetCapture() == window)
+            {
+                ReleaseCapture();
+            }
+            if (molecule_tool_active || bond_tool_active)
+            {
+                set_molecule_tool(window, false);
+            }
+            invalidate_scene_and_overlays(window);
             return 0;
         }
         if (w_param == 'C' && (l_param & (1L << 30)) == 0)
@@ -1781,6 +2091,11 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         if (w_param == 'B' && (l_param & (1L << 30)) == 0)
         {
             set_bond_tool(window, !bond_tool_active);
+            return 0;
+        }
+        if (w_param == 'F' && (l_param & (1L << 30)) == 0)
+        {
+            toggle_force_tool(window);
             return 0;
         }
         if (w_param == VK_OEM_4 && (l_param & (1L << 30)) == 0)
@@ -1934,6 +2249,11 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             drag_last_position = position;
             InvalidateRect(window, &area, FALSE);
         }
+        else if (force_dragging)
+        {
+            force_drag_end = position;
+            InvalidateRect(window, &area, FALSE);
+        }
         else if (molecule_dragging)
         {
             for (Molecule& molecule : molecules)
@@ -1959,7 +2279,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 }
                 break;
             }
-            InvalidateRect(window, &area, FALSE);
+            invalidate_scene_and_overlays(window);
         }
 
         TRACKMOUSEEVENT tracking{};
@@ -2010,6 +2330,16 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         return 0;
     }
 
+    if (message == WM_LBUTTONUP && force_dragging)
+    {
+        launch_force_drag(window);
+        force_dragging = false;
+        force_drag_molecule_id = 0;
+        ReleaseCapture();
+        invalidate_scene_and_overlays(window);
+        return 0;
+    }
+
     if (message == WM_RBUTTONUP && orbit_dragging)
     {
         orbit_dragging = false;
@@ -2039,6 +2369,9 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         orbit_dragging = false;
         pan_dragging = false;
         molecule_dragging = false;
+        force_tool_armed = false;
+        force_dragging = false;
+        force_drag_molecule_id = 0;
     }
 
     if (message == WM_LBUTTONDOWN)
@@ -2051,10 +2384,37 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         const RECT button_area = molecule_tool_area(client_area);
         const RECT simulation_button = simulation_tool_area(client_area);
         const RECT graphics_button = graphics_tool_area(client_area);
+        const RECT atom_type_button = atom_type_tool_area(client_area);
+        if (atom_type_picker_open)
+        {
+            const AtomType atom_types[]{
+                AtomType::oxygen, AtomType::hydrogen, AtomType::yureum};
+            for (int index = 0; index < 3; ++index)
+            {
+                const RECT key = atom_type_key_area(client_area, index);
+                if (PtInRect(&key, position))
+                {
+                    selected_atom_type = atom_types[index];
+                    atom_type_picker_open = false;
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            atom_type_picker_open = false;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
         if (PtInRect(&graphics_button, position))
         {
             SetFocus(window);
             show_graphics_menu(window);
+            return 0;
+        }
+        if (PtInRect(&atom_type_button, position))
+        {
+            SetFocus(window);
+            atom_type_picker_open = true;
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
         if (PtInRect(&simulation_button, position))
@@ -2070,6 +2430,22 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             return 0;
         }
         const RECT area = scene_area(client_area);
+        if (force_tool_armed && PtInRect(&area, position))
+        {
+            Molecule* molecule = pick_molecule(client_area, position);
+            if (molecule != nullptr &&
+                molecule->id == selected_molecule_id)
+            {
+                force_tool_armed = false;
+                force_dragging = true;
+                force_drag_molecule_id = molecule->id;
+                force_drag_start = position;
+                force_drag_end = position;
+                SetCapture(window);
+                InvalidateRect(window, &area, FALSE);
+            }
+            return 0;
+        }
         if (bond_tool_active && PtInRect(&area, position))
         {
             select_bond_endpoint(window, position);
@@ -2078,7 +2454,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         if (molecule_tool_active && PtInRect(&area, position))
         {
             place_molecule(window, position);
-            invalidate_simulation_ui(window, false);
+            invalidate_scene_and_overlays(window);
             return 0;
         }
         if (PtInRect(&area, position))
@@ -2140,7 +2516,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             {
                 molecule_placement_height = (std::clamp)(
                     molecule_placement_height + wheel_steps * 0.25,
-                    molecule_radius, 50.0);
+                    minimum_placement_height, 50.0);
                 InvalidateRect(window, &area, FALSE);
                 const RECT button_area = molecule_tool_area(client_area);
                 InvalidateRect(window, &button_area, FALSE);
