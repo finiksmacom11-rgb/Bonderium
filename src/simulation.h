@@ -89,7 +89,7 @@ struct Config
     Integrator integrator = Integrator::velocity_verlet;
     Thermostat thermostat = Thermostat::none;
     BoundaryMode boundary_mode = BoundaryMode::none;
-    CoulombSolver coulomb_solver = CoulombSolver::direct;
+    CoulombSolver coulomb_solver = CoulombSolver::barnes_hut;
 };
 
 struct Metrics
@@ -136,8 +136,6 @@ private:
     {
         std::size_t first = 0;
         std::size_t second = 0;
-        double sigma = 0.0;
-        double epsilon = 0.0;
     };
 
     bool validate_config(std::string& error) const;
@@ -153,12 +151,14 @@ private:
     std::vector<Bond> bonds_;
     std::vector<Angle> angles_;
     std::vector<NeighborPair> neighbor_pairs_;
+    std::vector<std::size_t> charged_particles_;
     std::vector<Vec3> neighbor_reference_positions_;
     Config config_;
     Config force_config_snapshot_;
     Metrics metrics_;
     double neighbor_reference_cutoff_ = -1.0;
     double neighbor_reference_skin_ = -1.0;
+    bool charged_particles_dirty_ = true;
     bool forces_initialized_ = false;
 };
 }

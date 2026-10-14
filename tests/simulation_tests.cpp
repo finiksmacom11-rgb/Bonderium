@@ -62,6 +62,32 @@ void test_coulomb_force_and_energy()
     assert(near(engine.metrics().potential_energy, 0.5));
 }
 
+void test_coulomb_remains_long_range_and_tracks_charge_changes()
+{
+    simulation::Engine engine;
+    engine.config().cutoff = 1.0;
+    const std::size_t first = engine.add_particle({0.0, 0.0, 0.0});
+    const std::size_t second = engine.add_particle({2.0, 0.0, 0.0});
+    const std::size_t third = engine.add_particle({4.0, 0.0, 0.0});
+    assert(engine.set_particle_properties(first, 1.0, 1.0, 1.0, 0.0, true));
+    assert(engine.set_particle_properties(second, 1.0, 1.0, 1.0, 0.0, true));
+    assert(engine.set_particle_properties(third, 1.0, 0.0, 1.0, 0.0, true));
+
+    std::string error;
+    assert(engine.step(error));
+    assert(near(engine.particles()[first].force.x, -0.25));
+    assert(near(engine.metrics().potential_energy, 0.5));
+
+    assert(engine.set_charge(third, 1.0));
+    assert(engine.step(error));
+    assert(near(engine.particles()[first].force.x, -0.3125));
+    assert(near(engine.metrics().potential_energy, 0.5 + 0.25 + 0.5));
+
+    assert(engine.set_particle_properties(third, 1.0, 0.0, 1.0, 0.0, true));
+    assert(engine.step(error));
+    assert(near(engine.particles()[first].force.x, -0.25));
+}
+
 void test_neighbor_cache_and_invalidation()
 {
     simulation::Engine engine;
@@ -325,6 +351,7 @@ int main()
 {
     test_lennard_jones_equilibrium();
     test_coulomb_force_and_energy();
+    test_coulomb_remains_long_range_and_tracks_charge_changes();
     test_neighbor_cache_and_invalidation();
     test_harmonic_bond();
     test_external_force_changes_velocity_without_teleporting();

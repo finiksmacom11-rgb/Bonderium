@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <GL/gl.h>
+#include <psapi.h>
 #include <shellapi.h>
 
 #include "simulation.h"
@@ -10,7 +11,6 @@
 #include <cstdint>
 #include <cwchar>
 #include <iterator>
-#include <vector>
 
 namespace
 {
@@ -89,7 +89,15 @@ enum GraphicsMenuCommand : UINT
     menu_quality_performance,
     menu_quality_balanced,
     menu_quality_high,
-    menu_toggle_grid
+    menu_toggle_grid,
+    menu_ram_unlimited = 20,
+    menu_ram_256_mb,
+    menu_ram_512_mb,
+    menu_ram_1_gb,
+    menu_ram_2_gb,
+    menu_ram_4_gb,
+    menu_ram_8_gb,
+    menu_ram_custom
 };
 
 enum class InteractionTool
@@ -118,13 +126,6 @@ struct CameraState
     ULONGLONG last_motion_tick = 0;
 };
 
-struct Molecule
-{
-    std::uint64_t id;
-    Vec3 position;
-    double radius;
-};
-
 struct Telemetry
 {
     ULONGLONG started_at = 0;
@@ -149,9 +150,7 @@ struct CameraBasis
 CameraState camera_state;
 Telemetry telemetry;
 LARGE_INTEGER performance_frequency{};
-std::vector<Molecule> molecules;
 simulation::Engine simulation_engine;
-std::uint64_t next_molecule_id = 1;
 HDC window_device_context = nullptr;
 HGLRC open_gl_context = nullptr;
 HFONT title_font = nullptr;
@@ -159,6 +158,9 @@ HFONT small_font = nullptr;
 HFONT button_font = nullptr;
 HFONT status_font = nullptr;
 GraphicsQuality graphics_quality = GraphicsQuality::balanced;
+std::uint64_t ram_budget_bytes = 0;
+std::uint64_t process_private_bytes = 0;
+bool process_memory_available = false;
 bool grid_visible = true;
 bool fullscreen = false;
 WINDOWPLACEMENT windowed_placement{};
@@ -481,39 +483,42 @@ bool world_to_screen(const RECT& client_area, Vec3 position, POINT& screen,
     return true;
 }
 
-Molecule* pick_molecule(const RECT& client_area, POINT screen)
+std::uint64_t pick_molecule(const RECT& client_area, POINT screen)
 {
     const RECT area = scene_area(client_area);
     if (!PtInRect(&area, screen))
     {
-        return nullptr;
+        return 0;
     }
 
-    Molecule* selected = nullptr;
+    std::uint64_t selected_id = 0;
     double nearest_depth = camera_maximum_distance;
     const double pixels_per_unit =
         static_cast<double>(area.bottom - area.top) /
         (2.0 * std::tan(field_of_view * pi / 360.0));
-    for (Molecule& molecule : molecules)
+    const auto& particles = simulation_engine.particles();
+    for (std::size_t index = 0; index < particles.size(); ++index)
     {
+        const Vec3 position = particles[index].position;
         POINT center{};
         double depth = 0.0;
-        if (!world_to_screen(client_area, molecule.position, center, depth))
+        if (!world_to_screen(client_area, position, center, depth))
         {
             continue;
         }
-        const double screen_radius = molecule.radius * pixels_per_unit / depth + 5.0;
+        const double screen_radius =
+            molecule_radius * pixels_per_unit / depth + 5.0;
         const double dx = static_cast<double>(screen.x - center.x);
         const double dy = static_cast<double>(screen.y - center.y);
         if (dx * dx + dy * dy <= screen_radius * screen_radius &&
             depth < nearest_depth)
         {
             nearest_depth = depth;
-            selected = &molecule;
+            selected_id = static_cast<std::uint64_t>(index + 1);
         }
     }
 
-    return selected;
+    return selected_id;
 }
 
 void set_camera_viewport(const RECT& client_area)
@@ -726,22 +731,20 @@ void draw_sphere(const Vec3& center, double radius, bool preview = false,
 void draw_molecules(const RECT& client_area)
 {
     const double cull_distance = grid_extent() + camera_state.distance;
-    for (const Molecule& molecule : molecules)
+    const auto& particles = simulation_engine.particles();
+    for (std::size_t index = 0; index < particles.size(); ++index)
     {
-        const Vec3 offset = molecule.position - camera_state.target;
+        const Vec3 position = particles[index].position;
+        const Vec3 offset = position - camera_state.target;
         if (dot(offset, offset) >
-            (cull_distance + molecule.radius) * (cull_distance + molecule.radius))
+            (cull_distance + molecule_radius) *
+                (cull_distance + molecule_radius))
         {
             continue;
         }
-        const std::size_t particle_index =
-            static_cast<std::size_t>(molecule.id - 1);
-        const double charge =
-            particle_index < simulation_engine.particles().size()
-            ? simulation_engine.particles()[particle_index].charge
-            : 0.0;
-        draw_sphere(molecule.position, molecule.radius,
-            false, molecule.id == selected_molecule_id, charge);
+        draw_sphere(position, molecule_radius, false,
+            static_cast<std::uint64_t>(index + 1) == selected_molecule_id,
+            particles[index].charge);
     }
 
     Vec3 preview_position{};
@@ -761,14 +764,15 @@ void draw_bonds()
     glLineWidth(2.0F);
     glColor3ub(255, 174, 94);
     glBegin(GL_LINES);
+    const auto& particles = simulation_engine.particles();
     for (const simulation::Bond& bond : simulation_engine.bonds())
     {
-        if (bond.first >= molecules.size() || bond.second >= molecules.size())
+        if (bond.first >= particles.size() || bond.second >= particles.size())
         {
             continue;
         }
-        const Vec3 first = molecules[bond.first].position;
-        const Vec3 second = molecules[bond.second].position;
+        const Vec3 first = particles[bond.first].position;
+        const Vec3 second = particles[bond.second].position;
         glVertex3d(first.x, first.y, first.z);
         glVertex3d(second.x, second.y, second.z);
     }
@@ -1054,7 +1058,8 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         wchar_t molecule_count[32]{};
         std::swprintf(molecule_count,
             sizeof(molecule_count) / sizeof(molecule_count[0]),
-            L"%llu", static_cast<unsigned long long>(molecules.size()));
+            L"%llu",             static_cast<unsigned long long>(
+                simulation_engine.particles().size()));
         RECT count_area{client_area.right - 196, toolbar.top + 16,
             client_area.right - 164, toolbar.top + 46};
         draw_text(device_context, molecule_count, count_area,
@@ -1086,9 +1091,11 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     wchar_t frame_time_value[24]{};
     wchar_t camera_value[32]{};
     wchar_t uptime_value[24]{};
+    wchar_t memory_value[32]{};
     const simulation::Metrics& metrics = simulation_engine.metrics();
     std::swprintf(molecule_value, sizeof(molecule_value) / sizeof(molecule_value[0]),
-        L"%llu", static_cast<unsigned long long>(molecules.size()));
+        L"%llu", static_cast<unsigned long long>(
+            simulation_engine.particles().size()));
     if (selected_molecule_id > 0 &&
         selected_molecule_id <= simulation_engine.particles().size())
     {
@@ -1157,6 +1164,28 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     const double camera_speed = std::sqrt(dot(camera_state.velocity, camera_state.velocity));
     std::swprintf(camera_value, sizeof(camera_value) / sizeof(camera_value[0]),
         L"%.1f u/s", camera_speed);
+    if (process_memory_available)
+    {
+        if (ram_budget_bytes == 0)
+        {
+            std::swprintf(memory_value,
+                sizeof(memory_value) / sizeof(memory_value[0]),
+                L"%.0f MB", process_private_bytes / (1024.0 * 1024.0));
+        }
+        else
+        {
+            std::swprintf(memory_value,
+                sizeof(memory_value) / sizeof(memory_value[0]),
+                L"%.0f / %.0f MB",
+                process_private_bytes / (1024.0 * 1024.0),
+                ram_budget_bytes / (1024.0 * 1024.0));
+        }
+    }
+    else
+    {
+        std::swprintf(memory_value,
+            sizeof(memory_value) / sizeof(memory_value[0]), L"Unavailable");
+    }
     const ULONGLONG uptime_seconds =
         telemetry.started_at == 0 ? 0 : (GetTickCount64() - telemetry.started_at) / 1000;
     if (uptime_seconds >= 3600)
@@ -1226,7 +1255,8 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         {L"CHARGE", charge_value},
         {L"FRAME TIME", frame_time_value},
         {L"CAMERA SPEED", camera_value},
-        {L"UPTIME", uptime_value}};
+        {L"UPTIME", uptime_value},
+        {L"RAM / BUDGET", memory_value}};
     constexpr int runtime_count = static_cast<int>(
         sizeof(runtime_metrics) / sizeof(runtime_metrics[0]));
     const int runtime_width = scene_width(client_area) / runtime_count;
@@ -1459,6 +1489,242 @@ void configure_graphics_for_this_pc(HWND window)
     InvalidateRect(window, nullptr, FALSE);
 }
 
+bool update_process_memory_usage()
+{
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+            sizeof(counters)))
+    {
+        process_memory_available = false;
+        return false;
+    }
+
+    process_private_bytes =
+        static_cast<std::uint64_t>(counters.PrivateUsage);
+    process_memory_available = true;
+    return true;
+}
+
+bool ram_budget_allows_molecule(HWND window)
+{
+    if (ram_budget_bytes == 0)
+    {
+        return true;
+    }
+    if (!update_process_memory_usage())
+    {
+        MessageBoxW(window,
+            L"Unable to measure memory usage. The molecule was not added "
+            L"because a RAM budget is active.",
+            L"Memory budget", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    const std::size_t particle_count =
+        simulation_engine.particles().size();
+    const std::size_t current_pairs =
+        simulation_engine.metrics().neighbor_pairs;
+    const std::uint64_t estimated_neighbors =
+        particle_count == 0 ? 16 :
+        (std::max)(std::uint64_t{16},
+            static_cast<std::uint64_t>(current_pairs) * 2 /
+                particle_count);
+    constexpr std::uint64_t estimated_particle_bytes = 1024;
+    constexpr std::uint64_t estimated_neighbor_pair_bytes = 16;
+    const std::uint64_t projected_bytes = process_private_bytes +
+        estimated_particle_bytes +
+        estimated_neighbors * estimated_neighbor_pair_bytes;
+    if (projected_bytes <= ram_budget_bytes)
+    {
+        return true;
+    }
+
+    MessageBoxW(window,
+        L"Adding this molecule would exceed the configured RAM budget. "
+        L"Increase the budget in OPT or remove molecules.",
+        L"Memory budget reached", MB_OK | MB_ICONWARNING);
+    return false;
+}
+
+struct RamBudgetDialogState
+{
+    HWND edit = nullptr;
+    bool done = false;
+    bool accepted = false;
+    std::uint64_t budget_bytes = 0;
+};
+
+LRESULT CALLBACK ram_budget_dialog_procedure(
+    HWND dialog, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    auto* state = reinterpret_cast<RamBudgetDialogState*>(
+        GetWindowLongPtrW(dialog, GWLP_USERDATA));
+    if (message == WM_NCCREATE)
+    {
+        const auto* creation =
+            reinterpret_cast<const CREATESTRUCTW*>(l_param);
+        state = static_cast<RamBudgetDialogState*>(
+            creation->lpCreateParams);
+        SetWindowLongPtrW(dialog, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr)
+    {
+        return DefWindowProcW(dialog, message, w_param, l_param);
+    }
+
+    if (message == WM_CREATE)
+    {
+        CreateWindowExW(0, L"STATIC",
+            L"Set a RAM budget in megabytes (128-65536):",
+            WS_CHILD | WS_VISIBLE, 18, 18, 320, 22, dialog, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
+            18, 46, 300, 26, dialog,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(101)),
+            GetModuleHandleW(nullptr), nullptr);
+        if (state->edit == nullptr ||
+            CreateWindowExW(0, L"BUTTON", L"Apply",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                154, 86, 78, 28, dialog,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)),
+                GetModuleHandleW(nullptr), nullptr) == nullptr ||
+            CreateWindowExW(0, L"BUTTON", L"Cancel",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                240, 86, 78, 28, dialog,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)),
+                GetModuleHandleW(nullptr), nullptr) == nullptr)
+        {
+            return -1;
+        }
+        const std::uint64_t current_megabytes =
+            ram_budget_bytes / (1024ULL * 1024ULL);
+        wchar_t initial_value[24]{};
+        std::swprintf(initial_value,
+            sizeof(initial_value) / sizeof(initial_value[0]),
+            L"%llu", static_cast<unsigned long long>(
+                current_megabytes == 0 ? 1024 : current_megabytes));
+        SetWindowTextW(state->edit, initial_value);
+        SetFocus(state->edit);
+        return 0;
+    }
+    if (message == WM_COMMAND && LOWORD(w_param) == IDOK)
+    {
+        wchar_t text[32]{};
+        GetWindowTextW(state->edit, text,
+            static_cast<int>(std::size(text)));
+        wchar_t* end = nullptr;
+        const unsigned long long megabytes = std::wcstoull(text, &end, 10);
+        if (end == text || *end != L'\0' ||
+            megabytes < 128 || megabytes > 65536)
+        {
+            MessageBoxW(dialog,
+                L"Enter a whole number from 128 to 65536 MB.",
+                L"Invalid RAM budget", MB_OK | MB_ICONWARNING);
+            SetFocus(state->edit);
+            return 0;
+        }
+        state->budget_bytes = megabytes * 1024ULL * 1024ULL;
+        state->accepted = true;
+        state->done = true;
+        DestroyWindow(dialog);
+        return 0;
+    }
+    if ((message == WM_COMMAND && LOWORD(w_param) == IDCANCEL) ||
+        message == WM_CLOSE)
+    {
+        state->done = true;
+        DestroyWindow(dialog);
+        return 0;
+    }
+    return DefWindowProcW(dialog, message, w_param, l_param);
+}
+
+void set_custom_ram_budget(HWND owner)
+{
+    static constexpr wchar_t dialog_class_name[] =
+        L"BonderiumRamBudgetDialog";
+    static bool class_registered = false;
+    if (!class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = ram_budget_dialog_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor =
+            LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground =
+            reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        window_class.lpszClassName = dialog_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(owner, L"Unable to open the RAM budget editor.",
+                L"Memory budget", MB_OK | MB_ICONERROR);
+            return;
+        }
+        class_registered = true;
+    }
+
+    RamBudgetDialogState state;
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    const int left = owner_rect.left +
+        ((owner_rect.right - owner_rect.left) - 350) / 2;
+    const int top = owner_rect.top +
+        ((owner_rect.bottom - owner_rect.top) - 155) / 2;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME,
+        dialog_class_name, L"RAM budget",
+        WS_CAPTION | WS_SYSMENU | WS_POPUP,
+        left, top, 350, 155, owner, nullptr, GetModuleHandleW(nullptr), &state);
+    if (dialog == nullptr)
+    {
+        MessageBoxW(owner, L"Unable to create the RAM budget editor.",
+            L"Memory budget", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    EnableWindow(owner, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    MSG message{};
+    while (!state.done)
+    {
+        const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+        if (result == 0)
+        {
+            PostQuitMessage(static_cast<int>(message.wParam));
+            state.done = true;
+            break;
+        }
+        if (result == -1)
+        {
+            state.done = true;
+            DestroyWindow(dialog);
+            EnableWindow(owner, TRUE);
+            MessageBoxW(owner, L"The RAM budget editor could not continue.",
+                L"Memory budget", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (!IsDialogMessageW(dialog, &message))
+        {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    if (state.accepted)
+    {
+        ram_budget_bytes = state.budget_bytes;
+        update_process_memory_usage();
+        InvalidateRect(owner, nullptr, FALSE);
+    }
+}
+
 void restart_application(HWND window)
 {
     const int choice = MessageBoxW(window,
@@ -1530,6 +1796,20 @@ void show_graphics_menu(HWND window)
     const UINT quality_high_flags =
         MF_STRING | (graphics_quality == GraphicsQuality::quality
                 ? MF_CHECKED : 0);
+    const auto ram_option_flags = [](std::uint64_t bytes) {
+        return MF_STRING |
+            (ram_budget_bytes == bytes ? MF_CHECKED : 0);
+    };
+    const UINT custom_ram_flags =
+        MF_STRING |
+        (ram_budget_bytes != 0 &&
+                ram_budget_bytes != 256ULL * 1024 * 1024 &&
+                ram_budget_bytes != 512ULL * 1024 * 1024 &&
+                ram_budget_bytes != 1024ULL * 1024 * 1024 &&
+                ram_budget_bytes != 2ULL * 1024 * 1024 * 1024 &&
+                ram_budget_bytes != 4ULL * 1024 * 1024 * 1024 &&
+                ram_budget_bytes != 8ULL * 1024 * 1024 * 1024
+            ? MF_CHECKED : 0);
 
     const bool menu_ready =
         AppendMenuW(menu, fullscreen_flags, menu_toggle_fullscreen,
@@ -1543,7 +1823,24 @@ void show_graphics_menu(HWND window)
         AppendMenuW(menu, quality_high_flags,
             menu_quality_high, L"High quality") &&
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
-        AppendMenuW(menu, grid_flags, menu_toggle_grid, L"Show grid");
+        AppendMenuW(menu, grid_flags, menu_toggle_grid, L"Show grid") &&
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"RAM budget") &&
+        AppendMenuW(menu, ram_option_flags(0),
+            menu_ram_unlimited, L"Unlimited") &&
+        AppendMenuW(menu, ram_option_flags(256ULL * 1024 * 1024),
+            menu_ram_256_mb, L"256 MB") &&
+        AppendMenuW(menu, ram_option_flags(512ULL * 1024 * 1024),
+            menu_ram_512_mb, L"512 MB") &&
+        AppendMenuW(menu, ram_option_flags(1024ULL * 1024 * 1024),
+            menu_ram_1_gb, L"1 GB") &&
+        AppendMenuW(menu, ram_option_flags(2ULL * 1024 * 1024 * 1024),
+            menu_ram_2_gb, L"2 GB") &&
+        AppendMenuW(menu, ram_option_flags(4ULL * 1024 * 1024 * 1024),
+            menu_ram_4_gb, L"4 GB") &&
+        AppendMenuW(menu, ram_option_flags(8ULL * 1024 * 1024 * 1024),
+            menu_ram_8_gb, L"8 GB") &&
+        AppendMenuW(menu, custom_ram_flags, menu_ram_custom, L"Custom...");
     if (!menu_ready)
     {
         DestroyMenu(menu);
@@ -1583,6 +1880,37 @@ void show_graphics_menu(HWND window)
     case menu_toggle_grid:
         grid_visible = !grid_visible;
         InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_unlimited:
+        ram_budget_bytes = 0;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_256_mb:
+        ram_budget_bytes = 256ULL * 1024 * 1024;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_512_mb:
+        ram_budget_bytes = 512ULL * 1024 * 1024;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_1_gb:
+        ram_budget_bytes = 1024ULL * 1024 * 1024;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_2_gb:
+        ram_budget_bytes = 2ULL * 1024 * 1024 * 1024;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_4_gb:
+        ram_budget_bytes = 4ULL * 1024 * 1024 * 1024;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_8_gb:
+        ram_budget_bytes = 8ULL * 1024 * 1024 * 1024;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
+    case menu_ram_custom:
+        set_custom_ram_budget(window);
         break;
     default:
         break;
@@ -1869,13 +2197,6 @@ void update_simulation(HWND window)
         ++completed_steps;
     }
 
-    const auto& particles = simulation_engine.particles();
-    for (std::size_t index = 0;
-         index < (std::min)(particles.size(), molecules.size()); ++index)
-    {
-        molecules[index].position = particles[index].position;
-    }
-
     RECT client_area{};
     GetClientRect(window, &client_area);
     const RECT area = scene_area(client_area);
@@ -1915,19 +2236,19 @@ void select_bond_endpoint(HWND window, POINT screen)
 {
     RECT client_area{};
     GetClientRect(window, &client_area);
-    Molecule* molecule = pick_molecule(client_area, screen);
-    if (molecule == nullptr)
+    const std::uint64_t molecule_id = pick_molecule(client_area, screen);
+    if (molecule_id == 0)
     {
         return;
     }
-    selected_molecule_id = molecule->id;
+    selected_molecule_id = molecule_id;
     if (pending_bond_molecule_id == 0)
     {
-        pending_bond_molecule_id = molecule->id;
+        pending_bond_molecule_id = molecule_id;
         invalidate_simulation_ui(window, false);
         return;
     }
-    if (pending_bond_molecule_id == molecule->id)
+    if (pending_bond_molecule_id == molecule_id)
     {
         pending_bond_molecule_id = 0;
         invalidate_simulation_ui(window, false);
@@ -1936,9 +2257,10 @@ void select_bond_endpoint(HWND window, POINT screen)
 
     const std::size_t first =
         static_cast<std::size_t>(pending_bond_molecule_id - 1);
-    const std::size_t second = static_cast<std::size_t>(molecule->id - 1);
+    const std::size_t second = static_cast<std::size_t>(molecule_id - 1);
+    const auto& particles = simulation_engine.particles();
     const Vec3 displacement =
-        molecules[first].position - molecules[second].position;
+        particles[first].position - particles[second].position;
     const double equilibrium_length = std::sqrt(dot(displacement, displacement));
     std::string error;
     if (!simulation_engine.add_bond(
@@ -2011,6 +2333,10 @@ void reset_view(HWND window)
 
 void place_molecule(HWND window, POINT position)
 {
+    if (!ram_budget_allows_molecule(window))
+    {
+        return;
+    }
     RECT client_area{};
     GetClientRect(window, &client_area);
     Vec3 world_position{};
@@ -2019,20 +2345,17 @@ void place_molecule(HWND window, POINT position)
     {
         return;
     }
-    const std::uint64_t id = next_molecule_id++;
-    molecules.push_back(Molecule{id, world_position, molecule_radius});
     const std::size_t particle_index =
         simulation_engine.add_particle(world_position);
     if (!simulation_engine.set_particle_properties(particle_index, 1.0, 0.0,
             molecule_sigma, molecule_epsilon, false))
     {
-        molecules.pop_back();
-        --next_molecule_id;
         MessageBoxW(window, L"Unable to initialize molecule physics properties.",
             L"Simulation error", MB_OK | MB_ICONERROR);
         return;
     }
-    selected_molecule_id = id;
+    selected_molecule_id =
+        static_cast<std::uint64_t>(particle_index + 1);
 }
 
 bool begin_molecule_interaction(
@@ -2040,24 +2363,26 @@ bool begin_molecule_interaction(
 {
     molecule_dragging = false;
     interacting_particle = static_cast<std::size_t>(-1);
-    Molecule* molecule = pick_molecule(client_area, screen);
-    if (molecule == nullptr)
+    const std::uint64_t molecule_id = pick_molecule(client_area, screen);
+    if (molecule_id == 0)
     {
         selected_molecule_id = 0;
         return false;
     }
 
-    selected_molecule_id = molecule->id;
+    selected_molecule_id = molecule_id;
     if (interaction_tool == InteractionTool::select ||
         !simulation_running)
     {
         return true;
     }
     Vec3 cursor_position{};
-    if (screen_to_plane(client_area, screen, molecule->position.z, cursor_position))
+    const Vec3 molecule_position = simulation_engine.particles()[
+        static_cast<std::size_t>(molecule_id - 1)].position;
+    if (screen_to_plane(client_area, screen, molecule_position.z, cursor_position))
     {
         interacting_particle =
-            static_cast<std::size_t>(molecule->id - 1);
+            static_cast<std::size_t>(molecule_id - 1);
         if (interacting_particle >= simulation_engine.particles().size())
         {
             interacting_particle = static_cast<std::size_t>(-1);
@@ -2066,7 +2391,7 @@ bool begin_molecule_interaction(
                 L"Simulation error", MB_OK | MB_ICONERROR);
             return true;
         }
-        molecule_drag_offset = molecule->position - cursor_position;
+        molecule_drag_offset = molecule_position - cursor_position;
         force_drag_start_position = screen;
         molecule_dragging = true;
     }
@@ -2726,6 +3051,21 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
     if (message == WM_TIMER && w_param == telemetry_timer_id)
     {
+        const bool memory_available = update_process_memory_usage();
+        if (ram_budget_bytes != 0 && simulation_running &&
+            (!memory_available || process_private_bytes >= ram_budget_bytes))
+        {
+            set_simulation_running(window, false);
+            MessageBoxW(window, memory_available
+                    ? L"Simulation paused because the configured RAM budget "
+                      L"was reached. Increase the budget in OPT or remove "
+                      L"molecules."
+                    : L"Simulation paused because memory usage could not be "
+                      L"measured while a RAM budget is active.",
+                L"Memory budget", memory_available
+                    ? MB_OK | MB_ICONWARNING
+                    : MB_OK | MB_ICONERROR);
+        }
         const ULONGLONG now = GetTickCount64();
         if (telemetry.simulation_sample_started_at == 0)
         {

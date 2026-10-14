@@ -20,7 +20,7 @@ target_compile_definitions(Bonderium PRIVATE
     BONDERIUM_VERSION="${BONDERIUM_VERSION}"
     BONDERIUM_ENABLE_UPDATES=$<BOOL:${BONDERIUM_ENABLE_UPDATES}>
 )
-target_link_libraries(Bonderium PRIVATE advapi32 shell32 winhttp opengl32)
+target_link_libraries(Bonderium PRIVATE advapi32 psapi shell32 winhttp opengl32)
 
 if(BUILD_TESTING)
     add_executable(SimulationTests
