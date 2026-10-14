@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <GL/gl.h>
+#include <shellapi.h>
 
 #include "simulation.h"
 #include "updater.h"
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <iterator>
 #include <vector>
 
 namespace
@@ -33,6 +35,14 @@ constexpr int interaction_tool_left = 798;
 constexpr int interaction_tool_width = 112;
 constexpr int interaction_tool_top = 14;
 constexpr int interaction_tool_height = 34;
+constexpr int auto_config_tool_left = 920;
+constexpr int auto_config_tool_width = 66;
+constexpr int auto_config_tool_top = 14;
+constexpr int auto_config_tool_height = 34;
+constexpr int restart_tool_left = 994;
+constexpr int restart_tool_width = 78;
+constexpr int restart_tool_top = 14;
+constexpr int restart_tool_height = 34;
 constexpr UINT_PTR camera_timer_id = 1;
 constexpr UINT_PTR telemetry_timer_id = 2;
 constexpr UINT_PTR simulation_timer_id = 3;
@@ -222,6 +232,12 @@ RECT scene_area(const RECT& client_area)
             client_area.bottom - footer_height)};
 }
 
+bool rectangles_intersect(const RECT& first, const RECT& second)
+{
+            return first.left < second.right && first.right > second.left &&
+                first.top < second.bottom && first.bottom > second.top;
+}
+
 RECT molecule_tool_area(const RECT& client_area)
 {
     return RECT{
@@ -256,6 +272,24 @@ RECT interaction_tool_area(const RECT& client_area)
             client_area.top + interaction_tool_top,
             client_area.left + interaction_tool_left + interaction_tool_width,
             client_area.top + interaction_tool_top + interaction_tool_height};
+}
+
+RECT auto_config_tool_area(const RECT& client_area)
+{
+            return RECT{
+                client_area.left + auto_config_tool_left,
+                client_area.top + auto_config_tool_top,
+                client_area.left + auto_config_tool_left + auto_config_tool_width,
+                client_area.top + auto_config_tool_top + auto_config_tool_height};
+}
+
+RECT restart_tool_area(const RECT& client_area)
+{
+            return RECT{
+                client_area.left + restart_tool_left,
+                client_area.top + restart_tool_top,
+                client_area.left + restart_tool_left + restart_tool_width,
+                client_area.top + restart_tool_top + restart_tool_height};
 }
 
 bool create_overlay_fonts(int dpi = 96)
@@ -316,9 +350,13 @@ void invalidate_simulation_ui(HWND window, bool toolbar)
             const RECT simulation_button = simulation_tool_area(client_area);
             const RECT interaction_button =
                 interaction_tool_area(client_area);
+            const RECT auto_button = auto_config_tool_area(client_area);
+            const RECT restart_button = restart_tool_area(client_area);
             InvalidateRect(window, &molecule_button, FALSE);
             InvalidateRect(window, &simulation_button, FALSE);
             InvalidateRect(window, &interaction_button, FALSE);
+            InvalidateRect(window, &auto_button, FALSE);
+            InvalidateRect(window, &restart_button, FALSE);
         }
 }
 
@@ -769,7 +807,7 @@ void render_scene(const RECT& client_area)
     const int width = scene_width(client_area);
     const int height = (std::max)(1, static_cast<int>(client_area.bottom));
 
-    glDrawBuffer(GL_FRONT);
+    glDrawBuffer(GL_BACK);
     glViewport(0, 0, width, height);
     glEnable(GL_SCISSOR_TEST);
     glScissor(area.left, height - area.bottom,
@@ -813,7 +851,6 @@ void render_scene(const RECT& client_area)
     glDisable(GL_LIGHTING);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
-    glFlush();
 }
 
 void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
@@ -964,6 +1001,38 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         molecule_dragging ? x_axis_color : primary_text_color,
         button_font, DT_CENTER);
 
+    const RECT auto_button = auto_config_tool_area(client_area);
+    HPEN auto_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH auto_brush = CreateSolidBrush(RGB(20, 27, 39));
+    HPEN previous_auto_pen =
+        static_cast<HPEN>(SelectObject(device_context, auto_pen));
+    HBRUSH previous_auto_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, auto_brush));
+    RoundRect(device_context, auto_button.left, auto_button.top,
+        auto_button.right, auto_button.bottom, 10, 10);
+    SelectObject(device_context, previous_auto_brush);
+    SelectObject(device_context, previous_auto_pen);
+    DeleteObject(auto_brush);
+    DeleteObject(auto_pen);
+    draw_text(device_context, L"AUTO", auto_button, primary_text_color,
+        button_font, DT_CENTER);
+
+    const RECT restart_button = restart_tool_area(client_area);
+    HPEN restart_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH restart_brush = CreateSolidBrush(RGB(20, 27, 39));
+    HPEN previous_restart_pen =
+        static_cast<HPEN>(SelectObject(device_context, restart_pen));
+    HBRUSH previous_restart_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, restart_brush));
+    RoundRect(device_context, restart_button.left, restart_button.top,
+        restart_button.right, restart_button.bottom, 10, 10);
+    SelectObject(device_context, previous_restart_brush);
+    SelectObject(device_context, previous_restart_pen);
+    DeleteObject(restart_brush);
+    DeleteObject(restart_pen);
+    draw_text(device_context, L"RESTART", restart_button,
+        primary_text_color, small_font, DT_CENTER);
+
     draw_text(device_context, L"X", RECT{654, toolbar.top + 16, 670, toolbar.top + 46},
         x_axis_color, status_font, DT_CENTER);
     draw_text(device_context, L"Y", RECT{678, toolbar.top + 16, 694, toolbar.top + 46},
@@ -971,14 +1040,14 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     draw_text(device_context, L"Z", RECT{702, toolbar.top + 16, 718, toolbar.top + 46},
         z_axis_color, status_font, DT_CENTER);
 
-    if (scene_width(client_area) > 1200)
+    if (scene_width(client_area) > 1380)
     {
         wchar_t camera_label[48]{};
         std::swprintf(camera_label,
             sizeof(camera_label) / sizeof(camera_label[0]),
             L"CAMERA %.1f u", camera_state.distance);
-        RECT camera_area{client_area.right - 210, toolbar.top + 16,
-            client_area.right - 112, toolbar.top + 46};
+        RECT camera_area{client_area.right - 330, toolbar.top + 16,
+            client_area.right - 220, toolbar.top + 46};
         draw_text(device_context, camera_label, camera_area, muted_text_color,
             small_font, DT_RIGHT);
 
@@ -986,8 +1055,8 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         std::swprintf(molecule_count,
             sizeof(molecule_count) / sizeof(molecule_count[0]),
             L"%llu", static_cast<unsigned long long>(molecules.size()));
-        RECT count_area{client_area.right - 104, toolbar.top + 16,
-            client_area.right - 72, toolbar.top + 46};
+        RECT count_area{client_area.right - 196, toolbar.top + 16,
+            client_area.right - 164, toolbar.top + 46};
         draw_text(device_context, molecule_count, count_area,
             primary_text_color, status_font, DT_RIGHT);
     }
@@ -1228,15 +1297,28 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     }
 }
 
-void draw_overlay(HDC device_context, const RECT& client_area)
+void draw_toolbar_overlay(HDC device_context, const RECT& client_area)
 {
     if (title_font != nullptr && small_font != nullptr &&
         button_font != nullptr && status_font != nullptr)
     {
         draw_toolbar(device_context, client_area, title_font, small_font,
             button_font, status_font);
+    }
+}
+
+void draw_footer_overlay(HDC device_context, const RECT& client_area)
+{
+    if (small_font != nullptr && status_font != nullptr)
+    {
         draw_footer(device_context, client_area, small_font, status_font);
     }
+}
+
+void draw_overlay(HDC device_context, const RECT& client_area)
+{
+    draw_toolbar_overlay(device_context, client_area);
+    draw_footer_overlay(device_context, client_area);
 }
 
 bool set_window_long_checked(HWND window, int index, LONG_PTR value);
@@ -1314,6 +1396,102 @@ void toggle_fullscreen(HWND window)
     }
 
     InvalidateRect(window, nullptr, FALSE);
+}
+
+void configure_graphics_for_this_pc(HWND window)
+{
+    const int choice = MessageBoxW(window,
+        L"Bonderium will check the processor, installed memory and display "
+        L"resolution, then choose a graphics quality preset for this PC. "
+        L"This only changes local rendering settings and does not send "
+        L"hardware information anywhere. Continue?",
+        L"Automatic PC configuration",
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+    if (choice != IDYES)
+    {
+        return;
+    }
+
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    MEMORYSTATUSEX memory_status{};
+    memory_status.dwLength = sizeof(memory_status);
+    if (!GlobalMemoryStatusEx(&memory_status))
+    {
+        MessageBoxW(window, L"Unable to read the installed memory amount.",
+            L"Automatic PC configuration", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    const HMONITOR monitor =
+        MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!GetMonitorInfoW(monitor, &monitor_info))
+    {
+        MessageBoxW(window, L"Unable to read the display resolution.",
+            L"Automatic PC configuration", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    const unsigned long long memory_gigabytes =
+        memory_status.ullTotalPhys / (1024ULL * 1024ULL * 1024ULL);
+    const int display_width =
+        monitor_info.rcMonitor.right - monitor_info.rcMonitor.left;
+    const int display_height =
+        monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top;
+    if (system_info.dwNumberOfProcessors <= 2 || memory_gigabytes < 6 ||
+        display_width < 1280 || display_height < 720)
+    {
+        graphics_quality = GraphicsQuality::performance;
+    }
+    else if (system_info.dwNumberOfProcessors >= 8 &&
+        memory_gigabytes >= 16 && display_width >= 1920 &&
+        display_height >= 1080)
+    {
+        graphics_quality = GraphicsQuality::quality;
+    }
+    else
+    {
+        graphics_quality = GraphicsQuality::balanced;
+    }
+
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+void restart_application(HWND window)
+{
+    const int choice = MessageBoxW(window,
+        L"Bonderium will close and start again. Molecules and simulation "
+        L"state that have not been saved will be lost. Restart now?",
+        L"Restart Bonderium", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (choice != IDYES)
+    {
+        return;
+    }
+
+    wchar_t executable_path[MAX_PATH]{};
+    SetLastError(ERROR_SUCCESS);
+    const DWORD path_length = GetModuleFileNameW(
+        nullptr, executable_path, static_cast<DWORD>(std::size(executable_path)));
+    if (path_length == 0 ||
+        path_length >= static_cast<DWORD>(std::size(executable_path)))
+    {
+        MessageBoxW(window, L"Unable to locate the Bonderium executable.",
+            L"Restart Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    const HINSTANCE launch_result = ShellExecuteW(window, L"open",
+        executable_path, nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(launch_result) <= 32)
+    {
+        MessageBoxW(window, L"Unable to start a replacement Bonderium process.",
+            L"Restart Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    PostMessageW(window, WM_CLOSE, 0, 0);
 }
 
 bool set_window_long_checked(HWND window, int index, LONG_PTR value)
@@ -1546,6 +1724,8 @@ void set_bond_tool(HWND window, bool active)
     invalidate_simulation_ui(window, true);
 }
 
+void stop_molecule_interaction(HWND window);
+
 void set_simulation_running(HWND window, bool running)
 {
     if (running && simulation_engine.particles().empty())
@@ -1557,6 +1737,10 @@ void set_simulation_running(HWND window, bool running)
         return;
     }
 
+    if (!running && molecule_dragging)
+    {
+        stop_molecule_interaction(window);
+    }
     simulation_running = running;
     simulation_time_accumulator = 0.0;
     last_simulation_tick = GetTickCount64();
@@ -1667,7 +1851,6 @@ void update_simulation(HWND window)
     if (molecule_dragging && !update_interaction_force(window))
     {
         set_simulation_running(window, false);
-        stop_molecule_interaction(window);
         return;
     }
     while (simulation_time_accumulator >= time_step &&
@@ -2078,6 +2261,16 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         if (scene_rendered)
         {
             render_scene(client_area);
+            if (!SwapBuffers(window_device_context))
+            {
+                wglMakeCurrent(nullptr, nullptr);
+                EndPaint(window, &paint);
+                MessageBoxW(window,
+                    L"Unable to present the 3D scene. Try Performance mode in OPT.",
+                    L"Bonderium — graphics error",
+                    MB_OK | MB_ICONERROR);
+                return 0;
+            }
             wglMakeCurrent(nullptr, nullptr);
         }
         else if (window_device_context == nullptr || open_gl_context == nullptr)
@@ -2089,7 +2282,32 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 static_cast<int>(std::wcslen(error)));
         }
 
-        draw_overlay(paint_context, client_area);
+        if (scene_rendered)
+        {
+            HDC overlay_context = GetDC(window);
+            if (overlay_context != nullptr)
+            {
+                draw_overlay(overlay_context, client_area);
+                ReleaseDC(window, overlay_context);
+            }
+        }
+        else
+        {
+            const RECT toolbar{
+                client_area.left, client_area.top,
+                client_area.right, client_area.top + toolbar_height};
+            const RECT footer{
+                client_area.left, client_area.bottom - footer_height,
+                client_area.right, client_area.bottom};
+            if (rectangles_intersect(paint.rcPaint, toolbar))
+            {
+                draw_toolbar_overlay(paint_context, client_area);
+            }
+            if (rectangles_intersect(paint.rcPaint, footer))
+            {
+                draw_footer_overlay(paint_context, client_area);
+            }
+        }
         EndPaint(window, &paint);
         if (scene_rendered)
         {
@@ -2375,6 +2593,20 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         const RECT graphics_button = graphics_tool_area(client_area);
         const RECT interaction_button =
             interaction_tool_area(client_area);
+        const RECT auto_button = auto_config_tool_area(client_area);
+        const RECT restart_button = restart_tool_area(client_area);
+        if (PtInRect(&auto_button, position))
+        {
+            SetFocus(window);
+            configure_graphics_for_this_pc(window);
+            return 0;
+        }
+        if (PtInRect(&restart_button, position))
+        {
+            SetFocus(window);
+            restart_application(window);
+            return 0;
+        }
         if (PtInRect(&interaction_button, position))
         {
             SetFocus(window);
@@ -2541,7 +2773,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     if (message == WM_GETMINMAXINFO)
     {
         auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
-        limits->ptMinTrackSize.x = 960;
+        limits->ptMinTrackSize.x = 1100;
         limits->ptMinTrackSize.y = 540;
         return 0;
     }

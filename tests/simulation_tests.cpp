@@ -107,9 +107,10 @@ void test_external_force_changes_velocity_without_teleporting()
     engine.config().time_step = 0.01;
     const std::size_t particle = engine.add_particle({1.0, 2.0, 3.0});
     set_neutral_lj(engine, particle);
-    assert(engine.set_external_force(particle, {4.0, 0.0, 0.0}));
 
     std::string error;
+    assert(engine.step(error));
+    assert(engine.set_external_force(particle, {4.0, 0.0, 0.0}));
     assert(engine.step(error));
     const simulation::Particle& accelerated = engine.particles()[particle];
     assert(near(accelerated.position.x, 1.0002));

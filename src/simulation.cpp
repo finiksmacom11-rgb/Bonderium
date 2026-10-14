@@ -513,8 +513,12 @@ bool Engine::set_external_force(std::size_t index, Vec3 force)
     {
         return false;
     }
-    particles_[index].external_force = force;
-    forces_initialized_ = false;
+    Particle& particle = particles_[index];
+    if (forces_initialized_)
+    {
+        particle.force += force - particle.external_force;
+    }
+    particle.external_force = force;
     return true;
 }
 
@@ -833,17 +837,24 @@ bool Engine::compute_forces(std::string& error)
         virial += dot(displacement, force);
     }
 
-    if (config_.coulomb_solver == CoulombSolver::barnes_hut &&
+    std::vector<std::size_t> charged_particles;
+    charged_particles.reserve(particles_.size());
+    for (std::size_t index = 0; index < particles_.size(); ++index)
+    {
+        if (particles_[index].charge != 0.0)
+        {
+            charged_particles.push_back(index);
+        }
+    }
+
+    if (!charged_particles.empty() &&
+        config_.coulomb_solver == CoulombSolver::barnes_hut &&
         particles_.size() >= barnes_hut_minimum_particles)
     {
         const BarnesHutTree tree(particles_, config_.barnes_hut_theta);
         std::vector<Vec3> coulomb_forces(particles_.size());
-        for (std::size_t index = 0; index < particles_.size(); ++index)
+        for (const std::size_t index : charged_particles)
         {
-            if (particles_[index].charge == 0.0)
-            {
-                continue;
-            }
             Vec3 force{};
             double particle_potential = 0.0;
             if (!tree.accumulate(index, config_.coulomb_constant,
@@ -868,20 +879,20 @@ bool Engine::compute_forces(std::string& error)
                 particles_[index].position - origin, coulomb_forces[index]);
         }
     }
-    else
+    else if (!charged_particles.empty())
     {
-        for (std::size_t first_index = 0;
-             first_index < particles_.size(); ++first_index)
+        for (std::size_t first_position = 0;
+             first_position < charged_particles.size(); ++first_position)
         {
-            for (std::size_t second_index = first_index + 1;
-                 second_index < particles_.size(); ++second_index)
+            for (std::size_t second_position = first_position + 1;
+                 second_position < charged_particles.size(); ++second_position)
             {
+                const std::size_t first_index =
+                    charged_particles[first_position];
+                const std::size_t second_index =
+                    charged_particles[second_position];
                 const Particle& first = particles_[first_index];
                 const Particle& second = particles_[second_index];
-                if (first.charge == 0.0 || second.charge == 0.0)
-                {
-                    continue;
-                }
                 const Vec3 displacement = first.position - second.position;
                 const double distance_squared = length_squared(displacement);
                 if (distance_squared < minimum_squared_distance)
