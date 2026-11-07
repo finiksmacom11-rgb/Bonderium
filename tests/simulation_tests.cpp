@@ -149,6 +149,29 @@ void test_external_force_changes_velocity_without_teleporting()
     assert(near(engine.particles()[particle].velocity.x, 0.04));
 }
 
+void test_freezing_stops_motion_and_releases_applied_force()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle = engine.add_particle({1.0, 0.0, 0.0});
+    assert(engine.set_velocity(particle, {2.0, 0.0, 0.0}));
+    assert(engine.set_external_force(particle, {4.0, 0.0, 0.0}));
+    assert(engine.set_particle_fixed(particle, true));
+
+    std::string error;
+    assert(engine.step(error));
+    const simulation::Particle& frozen = engine.particles()[particle];
+    assert(frozen.fixed);
+    assert(near(frozen.position.x, 1.0));
+    assert(near(frozen.velocity.x, 0.0));
+    assert(near(frozen.external_force.x, 0.0));
+
+    assert(engine.set_particle_fixed(particle, false));
+    assert(engine.step(error));
+    assert(!engine.particles()[particle].fixed);
+    assert(near(engine.particles()[particle].position.x, 1.0));
+}
+
 void test_harmonic_angle()
 {
     simulation::Engine engine;
@@ -345,6 +368,62 @@ void test_barnes_hut_coulomb_path()
         assert(std::isfinite(particle.force.z));
     }
 }
+
+void test_dimension_mode_constrains_particles_to_xy()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle =
+        engine.add_particle({0.0, 0.0, 3.0});
+    assert(engine.set_velocity(particle, {0.0, 0.0, 4.0}));
+    assert(engine.set_external_force(particle, {0.0, 0.0, 100.0}));
+    assert(engine.set_dimension_mode(true));
+    assert(engine.particles()[particle].position.z == 0.0);
+    assert(engine.particles()[particle].velocity.z == 0.0);
+
+    std::string error;
+    assert(engine.step(error));
+    assert(engine.particles()[particle].position.z == 0.0);
+    assert(engine.particles()[particle].velocity.z == 0.0);
+    assert(near(engine.metrics().temperature, 0.0));
+}
+
+void test_two_dimensional_line_wall_reflects_swept_particle()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    assert(engine.set_dimension_mode(true));
+    const std::size_t particle =
+        engine.add_particle({-1.0, 0.0, 0.0});
+    set_neutral_lj(engine, particle);
+    assert(engine.set_velocity(particle, {200.0, 0.0, 0.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{0.0, -2.0, 0.0}, {0.0, 2.0, 0.0}, false}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].position.x < 0.0);
+    assert(engine.particles()[particle].velocity.x < 0.0);
+    assert(engine.particles()[particle].position.z == 0.0);
+    assert(engine.particles()[particle].velocity.z == 0.0);
+}
+
+void test_three_dimensional_plane_wall_reflects_swept_particle()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle =
+        engine.add_particle({0.0, 0.0, -1.0});
+    set_neutral_lj(engine, particle);
+    assert(engine.set_velocity(particle, {0.0, 0.0, 200.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{-2.0, -2.0, 0.0}, {2.0, 2.0, 0.0}, true}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].position.z < 0.0);
+    assert(engine.particles()[particle].velocity.z < 0.0);
+}
 }
 
 int main()
@@ -355,6 +434,7 @@ int main()
     test_neighbor_cache_and_invalidation();
     test_harmonic_bond();
     test_external_force_changes_velocity_without_teleporting();
+    test_freezing_stops_motion_and_releases_applied_force();
     test_harmonic_angle();
     test_angle_force_matches_energy_gradient();
     test_bond_creation_adds_shared_harmonic_angle();
@@ -364,6 +444,9 @@ int main()
     test_soft_wall_force_and_overlapping_particle_error();
     test_reflective_boundary_and_thermostat_modes();
     test_barnes_hut_coulomb_path();
+    test_dimension_mode_constrains_particles_to_xy();
+    test_two_dimensional_line_wall_reflects_swept_particle();
+    test_three_dimensional_plane_wall_reflects_swept_particle();
     std::cout << "Simulation tests passed.\n";
     return 0;
 }

@@ -44,6 +44,13 @@ struct Angle
     double stiffness = 2.0;
 };
 
+struct Wall
+{
+    Vec3 start;
+    Vec3 end;
+    bool plane = false;
+};
+
 enum class Integrator
 {
     velocity_verlet,
@@ -86,6 +93,7 @@ struct Config
     double boundary_max = 20.0;
     double restitution = 0.8;
     double maximum_speed = 0.0;
+    bool two_dimensional = false;
     Integrator integrator = Integrator::velocity_verlet;
     Thermostat thermostat = Thermostat::none;
     BoundaryMode boundary_mode = BoundaryMode::none;
@@ -113,9 +121,12 @@ public:
     std::size_t add_particle(Vec3 position);
     bool add_bond(Bond bond, std::string& error);
     bool add_angle(Angle angle, std::string& error);
+    bool add_wall(Wall wall, std::string& error);
+    bool set_dimension_mode(bool two_dimensional);
     bool set_position(std::size_t index, Vec3 position);
     bool set_velocity(std::size_t index, Vec3 velocity);
     bool set_external_force(std::size_t index, Vec3 force);
+    bool set_particle_fixed(std::size_t index, bool fixed);
     bool set_charge(std::size_t index, double charge);
     bool set_particle_properties(std::size_t index, double mass, double charge,
         double sigma, double epsilon, bool fixed);
@@ -127,6 +138,7 @@ public:
     const std::vector<Particle>& particles() const;
     const std::vector<Bond>& bonds() const;
     const std::vector<Angle>& angles() const;
+    const std::vector<Wall>& walls() const;
     const Metrics& metrics() const;
     Config& config();
     const Config& config() const;
@@ -144,12 +156,14 @@ private:
     void rebuild_neighbor_list();
     bool needs_neighbor_rebuild() const;
     void apply_boundaries();
+    void apply_walls(const std::vector<Vec3>& previous_positions);
     void apply_thermostat();
     void update_metrics();
 
     std::vector<Particle> particles_;
     std::vector<Bond> bonds_;
     std::vector<Angle> angles_;
+    std::vector<Wall> walls_;
     std::vector<NeighborPair> neighbor_pairs_;
     std::vector<std::size_t> charged_particles_;
     std::vector<Vec3> neighbor_reference_positions_;

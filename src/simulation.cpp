@@ -379,6 +379,10 @@ double kinetic_energy(const std::vector<Particle>& particles)
 
 std::size_t Engine::add_particle(Vec3 position)
 {
+    if (config_.two_dimensional)
+    {
+        position.z = 0.0;
+    }
     Particle particle;
     particle.position = position;
     particles_.push_back(particle);
@@ -489,11 +493,56 @@ bool Engine::add_angle(Angle angle, std::string& error)
     return true;
 }
 
+bool Engine::add_wall(Wall wall, std::string& error)
+{
+    if (!finite(wall.start) || !finite(wall.end) ||
+        std::abs(wall.start.z - wall.end.z) > 1e-9 ||
+        (wall.plane &&
+            (std::abs(wall.end.x - wall.start.x) < 1e-9 ||
+                std::abs(wall.end.y - wall.start.y) < 1e-9)) ||
+        (!wall.plane &&
+            std::hypot(wall.end.x - wall.start.x,
+                wall.end.y - wall.start.y) < 1e-9))
+    {
+        error = "A wall must have finite, non-zero dimensions in the XY plane.";
+        return false;
+    }
+    walls_.push_back(wall);
+    forces_initialized_ = false;
+    return true;
+}
+
+bool Engine::set_dimension_mode(bool two_dimensional)
+{
+    if (config_.two_dimensional == two_dimensional)
+    {
+        return true;
+    }
+    config_.two_dimensional = two_dimensional;
+    if (two_dimensional)
+    {
+        for (Particle& particle : particles_)
+        {
+            particle.position.z = 0.0;
+            particle.velocity.z = 0.0;
+            particle.external_force.z = 0.0;
+            particle.force.z = 0.0;
+        }
+    }
+    forces_initialized_ = false;
+    invalidate_neighbors();
+    return true;
+}
+
 bool Engine::set_position(std::size_t index, Vec3 position)
 {
     if (index >= particles_.size() || !finite(position))
     {
         return false;
+    }
+    if (config_.two_dimensional)
+    {
+        position.z = 0.0;
     }
     particles_[index].position = position;
     forces_initialized_ = false;
@@ -506,6 +555,10 @@ bool Engine::set_velocity(std::size_t index, Vec3 velocity)
     {
         return false;
     }
+    if (config_.two_dimensional)
+    {
+        velocity.z = 0.0;
+    }
     particles_[index].velocity = velocity;
     return true;
 }
@@ -516,12 +569,36 @@ bool Engine::set_external_force(std::size_t index, Vec3 force)
     {
         return false;
     }
+    if (config_.two_dimensional)
+    {
+        force.z = 0.0;
+    }
     Particle& particle = particles_[index];
     if (forces_initialized_)
     {
         particle.force += force - particle.external_force;
     }
     particle.external_force = force;
+    return true;
+}
+
+bool Engine::set_particle_fixed(std::size_t index, bool fixed)
+{
+    if (index >= particles_.size())
+    {
+        return false;
+    }
+    Particle& particle = particles_[index];
+    if (particle.fixed != fixed)
+    {
+        particle.fixed = fixed;
+        if (fixed)
+        {
+            particle.velocity = Vec3{};
+            particle.external_force = Vec3{};
+        }
+        forces_initialized_ = false;
+    }
     return true;
 }
 
@@ -569,6 +646,7 @@ void Engine::clear()
     std::vector<Particle>().swap(particles_);
     std::vector<Bond>().swap(bonds_);
     std::vector<Angle>().swap(angles_);
+    std::vector<Wall>().swap(walls_);
     std::vector<NeighborPair>().swap(neighbor_pairs_);
     std::vector<std::size_t>().swap(charged_particles_);
     charged_particles_dirty_ = false;
@@ -660,6 +738,7 @@ bool Engine::force_configuration_matches() const
         force_config_snapshot_.boundary_min == config_.boundary_min &&
         force_config_snapshot_.boundary_max == config_.boundary_max &&
         force_config_snapshot_.boundary_mode == config_.boundary_mode &&
+        force_config_snapshot_.two_dimensional == config_.two_dimensional &&
         force_config_snapshot_.coulomb_solver == config_.coulomb_solver;
 }
 
@@ -802,8 +881,14 @@ bool Engine::compute_forces(std::string& error)
 
     for (Particle& particle : particles_)
     {
+        if (config_.two_dimensional)
+        {
+            particle.position.z = 0.0;
+            particle.velocity.z = 0.0;
+        }
         particle.force = particle.external_force +
-            Vec3{0.0, 0.0, particle.mass * config_.gravity_z};
+            Vec3{0.0, 0.0, config_.two_dimensional
+                ? 0.0 : particle.mass * config_.gravity_z};
     }
 
     double potential_energy = 0.0;
@@ -1027,7 +1112,9 @@ bool Engine::compute_forces(std::string& error)
                 particle.position.y - config_.boundary_max,
                 config_.boundary_min - particle.position.z,
                 particle.position.z - config_.boundary_max};
-            for (unsigned int axis = 0; axis < 3; ++axis)
+            const unsigned int axis_count =
+                config_.two_dimensional ? 2U : 3U;
+            for (unsigned int axis = 0; axis < axis_count; ++axis)
             {
                 for (unsigned int side = 0; side < 2; ++side)
                 {
@@ -1067,7 +1154,14 @@ bool Engine::compute_forces(std::string& error)
             }
         }
         potential_energy -= particle.mass * config_.gravity_z *
-            particle.position.z;
+            (config_.two_dimensional ? 0.0 : particle.position.z);
+    }
+    if (config_.two_dimensional)
+    {
+        for (Particle& particle : particles_)
+        {
+            particle.force.z = 0.0;
+        }
     }
 
     metrics_.potential_energy = potential_energy;
@@ -1091,7 +1185,8 @@ void Engine::apply_boundaries()
             &particle.position.z};
         double* velocities[]{&particle.velocity.x, &particle.velocity.y,
             &particle.velocity.z};
-        for (std::size_t axis = 0; axis < 3; ++axis)
+        const std::size_t axis_count = config_.two_dimensional ? 2 : 3;
+        for (std::size_t axis = 0; axis < axis_count; ++axis)
         {
             if (*coordinates[axis] < config_.boundary_min)
             {
@@ -1104,6 +1199,139 @@ void Engine::apply_boundaries()
                 *coordinates[axis] = config_.boundary_max;
                 *velocities[axis] = -std::abs(*velocities[axis]) *
                     config_.restitution;
+            }
+        }
+    }
+}
+
+void Engine::apply_walls(const std::vector<Vec3>& previous_positions)
+{
+    constexpr double particle_radius_scale = 0.25;
+    for (std::size_t index = 0; index < particles_.size(); ++index)
+    {
+        Particle& particle = particles_[index];
+        if (particle.fixed || index >= previous_positions.size())
+        {
+            continue;
+        }
+        const Vec3 previous = previous_positions[index];
+        const double radius = (std::max)(0.01,
+            particle.sigma * particle_radius_scale);
+        for (const Wall& wall : walls_)
+        {
+            if (config_.two_dimensional && !wall.plane)
+            {
+                const double dx = wall.end.x - wall.start.x;
+                const double dy = wall.end.y - wall.start.y;
+                const double length_squared = dx * dx + dy * dy;
+                const double length = std::sqrt(length_squared);
+                const double nx = -dy / length;
+                const double ny = dx / length;
+                const double previous_side =
+                    (previous.x - wall.start.x) * nx +
+                    (previous.y - wall.start.y) * ny;
+                const double current_side =
+                    (particle.position.x - wall.start.x) * nx +
+                    (particle.position.y - wall.start.y) * ny;
+                const double side = previous_side < 0.0 ? -1.0 : 1.0;
+                const bool crossed = previous_side * current_side <= 0.0;
+                const double denominator = previous_side - current_side;
+                double hit_x = particle.position.x;
+                double hit_y = particle.position.y;
+                bool hit_segment = false;
+                if (crossed && std::abs(denominator) > 1e-12)
+                {
+                    const double fraction = previous_side / denominator;
+                    hit_x = previous.x +
+                        (particle.position.x - previous.x) * fraction;
+                    hit_y = previous.y +
+                        (particle.position.y - previous.y) * fraction;
+                    const double projection =
+                        ((hit_x - wall.start.x) * dx +
+                            (hit_y - wall.start.y) * dy) / length_squared;
+                    hit_segment = projection >= 0.0 && projection <= 1.0;
+                }
+
+                const double closest_fraction = (std::clamp)(
+                    ((particle.position.x - wall.start.x) * dx +
+                        (particle.position.y - wall.start.y) * dy) /
+                        length_squared, 0.0, 1.0);
+                const double closest_x = wall.start.x + closest_fraction * dx;
+                const double closest_y = wall.start.y + closest_fraction * dy;
+                const double separation_x = particle.position.x - closest_x;
+                const double separation_y = particle.position.y - closest_y;
+                const double separation_squared =
+                    separation_x * separation_x + separation_y * separation_y;
+                const bool overlapped = separation_squared < radius * radius;
+                if (!hit_segment && !overlapped)
+                {
+                    continue;
+                }
+
+                const double correction_side = crossed
+                    ? side
+                    : ((particle.position.x - wall.start.x) * nx +
+                        (particle.position.y - wall.start.y) * ny) < 0.0
+                    ? -1.0 : 1.0;
+                if (hit_segment)
+                {
+                    const double remaining_x = particle.position.x - hit_x;
+                    const double remaining_y = particle.position.y - hit_y;
+                    const double normal_distance =
+                        remaining_x * nx + remaining_y * ny;
+                    particle.position.x = hit_x +
+                        remaining_x - 2.0 * normal_distance * nx +
+                        correction_side * radius * nx;
+                    particle.position.y = hit_y +
+                        remaining_y - 2.0 * normal_distance * ny +
+                        correction_side * radius * ny;
+                }
+                else
+                {
+                    const double separation = std::sqrt(separation_squared);
+                    const double normal_x = separation > 1e-12
+                        ? separation_x / separation : correction_side * nx;
+                    const double normal_y = separation > 1e-12
+                        ? separation_y / separation : correction_side * ny;
+                    particle.position.x = closest_x + radius * normal_x;
+                    particle.position.y = closest_y + radius * normal_y;
+                }
+                const double normal_velocity =
+                    particle.velocity.x * nx + particle.velocity.y * ny;
+                if (normal_velocity * correction_side < 0.0 || hit_segment)
+                {
+                    particle.velocity.x -=
+                        2.0 * normal_velocity * nx;
+                    particle.velocity.y -=
+                        2.0 * normal_velocity * ny;
+                }
+            }
+            else if (!config_.two_dimensional && wall.plane)
+            {
+                const double plane_z = wall.start.z;
+                const double previous_distance = previous.z - plane_z;
+                const double current_distance =
+                    particle.position.z - plane_z;
+                const bool crossed =
+                    previous_distance * current_distance <= 0.0;
+                const double side = previous_distance < 0.0 ? -1.0 : 1.0;
+                const bool inside =
+                    particle.position.x >=
+                            (std::min)(wall.start.x, wall.end.x) - radius &&
+                    particle.position.x <=
+                            (std::max)(wall.start.x, wall.end.x) + radius &&
+                    particle.position.y >=
+                            (std::min)(wall.start.y, wall.end.y) - radius &&
+                    particle.position.y <=
+                            (std::max)(wall.start.y, wall.end.y) + radius;
+                if ((crossed || std::abs(current_distance) < radius) && inside)
+                {
+                    particle.position.z = plane_z + side * radius;
+                    if (particle.velocity.z * side < 0.0 || crossed)
+                    {
+                        particle.velocity.z = -particle.velocity.z;
+                    }
+                }
             }
         }
     }
@@ -1129,8 +1357,9 @@ void Engine::apply_thermostat()
         return;
     }
 
+    const double degrees_of_freedom = config_.two_dimensional ? 2.0 : 3.0;
     const double temperature = 2.0 * kinetic_energy(particles_) /
-        (3.0 * static_cast<double>(mobile_count));
+        (degrees_of_freedom * static_cast<double>(mobile_count));
     if (config_.thermostat == Thermostat::andersen)
     {
         static thread_local std::mt19937_64 generator(std::random_device{}());
@@ -1147,7 +1376,8 @@ void Engine::apply_thermostat()
                 std::sqrt(config_.target_temperature / particle.mass);
             std::normal_distribution<double> velocity(0.0, standard_deviation);
             particle.velocity = Vec3{
-                velocity(generator), velocity(generator), velocity(generator)};
+                velocity(generator), velocity(generator),
+                config_.two_dimensional ? 0.0 : velocity(generator)};
         }
     }
     else if (config_.thermostat == Thermostat::berendsen &&
@@ -1200,19 +1430,22 @@ void Engine::update_metrics()
     if (mobile_count > 0)
     {
         metrics_.temperature = metrics_.kinetic_energy * 2.0 /
-            (3.0 * static_cast<double>(mobile_count));
+            ((config_.two_dimensional ? 2.0 : 3.0) *
+                static_cast<double>(mobile_count));
     }
     if (config_.boundary_mode != BoundaryMode::none)
     {
         const double length = config_.boundary_max - config_.boundary_min;
-        const double volume = length * length * length;
+        const double volume = config_.two_dimensional
+            ? length * length : length * length * length;
         metrics_.number_density =
             static_cast<double>(particles_.size()) / volume;
         if (!particles_.empty())
         {
             metrics_.pressure =
                 (2.0 * metrics_.kinetic_energy +
-                    metrics_.configurational_virial) / (3.0 * volume);
+                    metrics_.configurational_virial) /
+                    ((config_.two_dimensional ? 2.0 : 3.0) * volume);
             metrics_.pressure_available = true;
         }
     }
@@ -1240,6 +1473,13 @@ bool Engine::step(std::string& error)
         return false;
     }
 
+    std::vector<Vec3> previous_positions;
+    previous_positions.reserve(particles_.size());
+    for (const Particle& particle : particles_)
+    {
+        previous_positions.push_back(particle.position);
+    }
+
     const double half_time_step = config_.time_step * 0.5;
     for (Particle& particle : particles_)
     {
@@ -1261,6 +1501,7 @@ bool Engine::step(std::string& error)
         }
     }
     apply_boundaries();
+    apply_walls(previous_positions);
     if (!compute_forces(error))
     {
         return false;
@@ -1271,6 +1512,11 @@ bool Engine::step(std::string& error)
         {
             particle.velocity +=
                 (particle.force / particle.mass) * half_time_step;
+            if (config_.two_dimensional)
+            {
+                particle.position.z = 0.0;
+                particle.velocity.z = 0.0;
+            }
         }
     }
     apply_thermostat();
@@ -1312,6 +1558,11 @@ const std::vector<Bond>& Engine::bonds() const
 const std::vector<Angle>& Engine::angles() const
 {
     return angles_;
+}
+
+const std::vector<Wall>& Engine::walls() const
+{
+    return walls_;
 }
 
 const Metrics& Engine::metrics() const

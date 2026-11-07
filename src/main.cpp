@@ -7,22 +7,35 @@
 #include "updater.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
 #include <iterator>
+#include <utility>
+#include <vector>
 
 namespace
 {
 constexpr wchar_t window_title[] = L"Bonderium — 3D Molecular Space";
 constexpr wchar_t window_class_name[] = L"BonderiumWindow";
+constexpr wchar_t detached_interface_class_name[] =
+    L"BonderiumDetachedInterface";
+constexpr wchar_t detached_settings_class_name[] =
+    L"BonderiumDetachedSettings";
+constexpr wchar_t chart_window_class_name[] = L"BonderiumChartWindow";
 
 constexpr int toolbar_height = 62;
 constexpr int footer_height = 116;
+constexpr int tools_panel_width = 220;
 constexpr int molecule_tool_left = 258;
 constexpr int molecule_tool_width = 148;
 constexpr int molecule_tool_top = 14;
 constexpr int molecule_tool_height = 34;
+constexpr int help_tool_left = 226;
+constexpr int help_tool_width = 28;
+constexpr int help_tool_top = 18;
+constexpr int help_tool_height = 26;
 constexpr int simulation_tool_left = 420;
 constexpr int simulation_tool_width = 126;
 constexpr int simulation_tool_top = 14;
@@ -49,6 +62,11 @@ constexpr UINT_PTR simulation_timer_id = 3;
 constexpr UINT_PTR motion_timer_interval_ms = 16;
 constexpr UINT simulation_timer_interval_ms = 8;
 constexpr unsigned int maximum_catch_up_steps = 12;
+constexpr double minimum_time_flow_factor = 0.25;
+constexpr double maximum_time_flow_factor = 4.0;
+constexpr std::size_t chart_sample_capacity = 3000;
+constexpr std::size_t maximum_chart_particles = 8;
+constexpr std::uint64_t chart_sample_step_stride = 10;
 
 constexpr double camera_default_distance = 28.0;
 constexpr double camera_minimum_distance = 3.0;
@@ -97,7 +115,13 @@ enum GraphicsMenuCommand : UINT
     menu_ram_2_gb,
     menu_ram_4_gb,
     menu_ram_8_gb,
-    menu_ram_custom
+    menu_ram_custom,
+    menu_panel_toolbar = 40,
+    menu_panel_footer,
+    menu_panel_tools,
+    menu_separate_interface = 60,
+    menu_open_detached_settings,
+    menu_open_charts
 };
 
 enum class InteractionTool
@@ -107,11 +131,52 @@ enum class InteractionTool
     directional_force
 };
 
+enum class MolecularTool
+{
+    select,
+    multi_select,
+    square_lattice
+};
+
+enum class ScenarioAction
+{
+    apply_force,
+    spawn_lattice
+};
+
+struct ScenarioStep
+{
+    ScenarioAction action = ScenarioAction::apply_force;
+    double duration_seconds = 1.0;
+    simulation::Vec3 force;
+    std::vector<std::size_t> targets;
+    std::size_t lattice_count = 0;
+    simulation::Vec3 lattice_start;
+    simulation::Vec3 lattice_end;
+};
+
+struct InputDialogState
+{
+    HWND edits[4]{};
+    const wchar_t* title = nullptr;
+    const wchar_t* labels[4]{};
+    wchar_t values[4][32]{};
+    std::size_t field_count = 0;
+    bool done = false;
+    bool accepted = false;
+};
+
 enum InteractionMenuCommand : UINT
 {
     menu_interaction_select = 101,
     menu_interaction_spring_drag,
     menu_interaction_directional_force
+};
+
+enum ScenarioMenuCommand : UINT
+{
+    menu_scenario_force_step = 201,
+    menu_scenario_lattice_step
 };
 
 using simulation::Vec3;
@@ -139,6 +204,14 @@ struct Telemetry
     ULONGLONG simulation_sample_started_at = 0;
 };
 
+struct ChartSample
+{
+    double time = 0.0;
+    std::array<double, 5> system_values{};
+    std::array<std::array<double, 8>, maximum_chart_particles>
+        particle_values{};
+};
+
 struct CameraBasis
 {
     Vec3 eye;
@@ -162,12 +235,51 @@ std::uint64_t ram_budget_bytes = 0;
 std::uint64_t process_private_bytes = 0;
 bool process_memory_available = false;
 bool grid_visible = true;
+bool toolbar_visible = true;
+bool footer_visible = true;
+bool tools_panel_visible = true;
 bool fullscreen = false;
+bool separate_interface_windows = false;
+double time_flow_factor = 1.0;
+bool time_slider_dragging = false;
 WINDOWPLACEMENT windowed_placement{};
 LONG_PTR windowed_style = 0;
 LONG_PTR windowed_extended_style = 0;
+HWND main_window = nullptr;
+HWND detached_interface_window = nullptr;
+HWND detached_settings_window = nullptr;
+HBRUSH detached_settings_background = nullptr;
+HWND chart_window = nullptr;
+std::vector<std::size_t> chart_particle_indices;
+std::vector<ChartSample> chart_samples;
+std::size_t chart_next_sample = 0;
+std::size_t chart_sample_count = 0;
+bool chart_recording = false;
+std::uint64_t chart_last_recorded_step = 0;
+std::size_t chart_quantity = 0;
+bool chart_difference_mode = false;
+bool chart_selection_initialized = false;
 bool molecule_tool_active = false;
 bool bond_tool_active = false;
+bool wall_tool_active = false;
+bool wall_dragging = false;
+bool saved_3d_camera = false;
+double saved_3d_yaw = -pi / 4.0;
+double saved_3d_pitch = pi / 3.0;
+Vec3 wall_start{};
+Vec3 wall_end{};
+MolecularTool molecular_tool = MolecularTool::select;
+std::vector<std::size_t> selected_particles;
+std::vector<ScenarioStep> scenario_steps;
+bool scenario_running = false;
+double scenario_elapsed_seconds = 0.0;
+std::size_t active_scenario_step = static_cast<std::size_t>(-1);
+std::size_t square_lattice_count = 25;
+bool square_lattice_dragging = false;
+bool square_lattice_for_scenario = false;
+double pending_lattice_duration = 1.0;
+Vec3 square_lattice_start{};
+Vec3 square_lattice_end{};
 std::uint64_t pending_bond_molecule_id = 0;
 bool simulation_running = false;
 double simulation_time_accumulator = 0.0;
@@ -226,12 +338,47 @@ int scene_width(const RECT& client_area)
 
 RECT scene_area(const RECT& client_area)
 {
+    const int top = client_area.top +
+        (!separate_interface_windows && toolbar_visible ? toolbar_height : 0);
+    const int bottom = (std::max)(top,
+        static_cast<int>(client_area.bottom) -
+            (!separate_interface_windows && footer_visible ? footer_height : 0));
     return RECT{
-        client_area.left,
-        client_area.top + toolbar_height,
+        client_area.left, top,
+        (std::max)(client_area.left,
+            client_area.right -
+                (!separate_interface_windows && tools_panel_visible
+                    ? tools_panel_width : 0)),
+        bottom};
+}
+
+RECT toolbar_area(const RECT& client_area)
+{
+    return RECT{client_area.left, client_area.top, client_area.right,
+        client_area.top + toolbar_height};
+}
+
+RECT footer_area(const RECT& client_area)
+{
+    return RECT{client_area.left,
+        client_area.bottom - footer_height,
+        client_area.right, client_area.bottom};
+}
+
+RECT tools_panel_area(const RECT& client_area)
+{
+    return RECT{
+        client_area.right - tools_panel_width,
+        client_area.top + (toolbar_visible ? toolbar_height : 0),
         client_area.right,
-        (std::max)(client_area.top + toolbar_height,
-            client_area.bottom - footer_height)};
+        client_area.bottom - (footer_visible ? footer_height : 0)};
+}
+
+RECT tools_panel_button_area(const RECT& client_area, int row)
+{
+    const RECT panel = tools_panel_area(client_area);
+    const int top = panel.top + 48 + row * 40;
+    return RECT{panel.left + 12, top, panel.right - 12, top + 32};
 }
 
 bool rectangles_intersect(const RECT& first, const RECT& second)
@@ -249,6 +396,15 @@ RECT molecule_tool_area(const RECT& client_area)
         client_area.top + molecule_tool_top + molecule_tool_height};
 }
 
+RECT help_tool_area(const RECT& client_area)
+{
+    return RECT{
+        client_area.left + help_tool_left,
+        client_area.top + help_tool_top,
+        client_area.left + help_tool_left + help_tool_width,
+        client_area.top + help_tool_top + help_tool_height};
+}
+
 RECT simulation_tool_area(const RECT& client_area)
 {
         return RECT{
@@ -256,6 +412,31 @@ RECT simulation_tool_area(const RECT& client_area)
             client_area.top + simulation_tool_top,
             client_area.left + simulation_tool_left + simulation_tool_width,
             client_area.top + simulation_tool_top + simulation_tool_height};
+}
+
+RECT time_flow_slider_area(const RECT& client_area)
+{
+    return RECT{client_area.left + 554, client_area.top + 12,
+        client_area.left + 648, client_area.top + 52};
+}
+
+void set_time_flow_from_pointer(HWND window, POINT position)
+{
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT slider = time_flow_slider_area(client_area);
+    const int left = slider.left + 8;
+    const int right = slider.right - 8;
+    const double fraction = static_cast<double>(
+        (std::clamp)(static_cast<int>(position.x), left, right) - left) /
+        static_cast<double>((std::max)(1, right - left));
+    time_flow_factor = minimum_time_flow_factor +
+        fraction * (maximum_time_flow_factor - minimum_time_flow_factor);
+    InvalidateRect(window, &slider, FALSE);
+    if (detached_interface_window != nullptr)
+    {
+        InvalidateRect(detached_interface_window, nullptr, FALSE);
+    }
 }
 
 RECT graphics_tool_area(const RECT& client_area)
@@ -341,12 +522,13 @@ void invalidate_simulation_ui(HWND window, bool toolbar)
         RECT client_area{};
         GetClientRect(window, &client_area);
         const RECT scene = scene_area(client_area);
-        const RECT footer{
-            client_area.left, client_area.bottom - footer_height,
-            client_area.right, client_area.bottom};
         InvalidateRect(window, &scene, FALSE);
-        InvalidateRect(window, &footer, FALSE);
-        if (toolbar)
+        if (footer_visible)
+        {
+            const RECT footer = footer_area(client_area);
+            InvalidateRect(window, &footer, FALSE);
+        }
+        if (toolbar && toolbar_visible)
         {
             const RECT molecule_button = molecule_tool_area(client_area);
             const RECT simulation_button = simulation_tool_area(client_area);
@@ -359,6 +541,16 @@ void invalidate_simulation_ui(HWND window, bool toolbar)
             InvalidateRect(window, &interaction_button, FALSE);
             InvalidateRect(window, &auto_button, FALSE);
             InvalidateRect(window, &restart_button, FALSE);
+        }
+        if (tools_panel_visible)
+        {
+            const RECT tools = tools_panel_area(client_area);
+            InvalidateRect(window, &tools, FALSE);
+        }
+        if (tools_panel_visible)
+        {
+            const RECT tools = tools_panel_area(client_area);
+            InvalidateRect(window, &tools, FALSE);
         }
 }
 
@@ -414,7 +606,9 @@ CameraBasis camera_basis()
         camera_state.distance * std::sin(camera_state.pitch)};
     const Vec3 eye = camera_state.target + offset;
     const Vec3 forward = normalized(camera_state.target - eye);
-    const Vec3 right = normalized(cross(forward, Vec3{0.0, 0.0, 1.0}));
+    const Vec3 world_up = std::abs(forward.z) > 0.98
+        ? Vec3{0.0, 1.0, 0.0} : Vec3{0.0, 0.0, 1.0};
+    const Vec3 right = normalized(cross(forward, world_up));
     const Vec3 up = normalized(cross(right, forward));
     return CameraBasis{eye, forward, right, up};
 }
@@ -619,8 +813,11 @@ void draw_grid()
     glVertex3d(0.0, minimum_y, 0.025);
     glVertex3d(0.0, maximum_y, 0.025);
     glColor3ub(255, 174, 94);
-    glVertex3d(0.0, 0.0, 0.025);
-    glVertex3d(0.0, 0.0, extent);
+    if (!simulation_engine.config().two_dimensional)
+    {
+        glVertex3d(0.0, 0.0, 0.025);
+        glVertex3d(0.0, 0.0, extent);
+    }
     glEnd();
     glLineWidth(1.0F);
 }
@@ -659,6 +856,63 @@ void draw_simulation_boundaries()
         glVertex3d(second.x, second.y, second.z);
     }
     glEnd();
+    glLineWidth(1.0F);
+}
+
+void draw_walls()
+{
+    const bool two_dimensional =
+        simulation_engine.config().two_dimensional;
+    glDisable(GL_LIGHTING);
+    glLineWidth(3.0F);
+    glColor3ub(69, 214, 201);
+    glBegin(GL_LINES);
+    for (const simulation::Wall& wall : simulation_engine.walls())
+    {
+        if (wall.plane == two_dimensional)
+        {
+            continue;
+        }
+        if (wall.plane)
+        {
+            glVertex3d(wall.start.x, wall.start.y, wall.start.z);
+            glVertex3d(wall.end.x, wall.start.y, wall.start.z);
+            glVertex3d(wall.end.x, wall.start.y, wall.start.z);
+            glVertex3d(wall.end.x, wall.end.y, wall.start.z);
+            glVertex3d(wall.end.x, wall.end.y, wall.start.z);
+            glVertex3d(wall.start.x, wall.end.y, wall.start.z);
+            glVertex3d(wall.start.x, wall.end.y, wall.start.z);
+            glVertex3d(wall.start.x, wall.start.y, wall.start.z);
+        }
+        else
+        {
+            glVertex3d(wall.start.x, wall.start.y, wall.start.z + 0.03);
+            glVertex3d(wall.end.x, wall.end.y, wall.end.z + 0.03);
+        }
+    }
+    glEnd();
+    if (wall_tool_active && wall_dragging)
+    {
+        glColor3ub(255, 174, 94);
+        glBegin(GL_LINES);
+        if (two_dimensional)
+        {
+            glVertex3d(wall_start.x, wall_start.y, 0.04);
+            glVertex3d(wall_end.x, wall_end.y, 0.04);
+        }
+        else
+        {
+            glVertex3d(wall_start.x, wall_start.y, wall_start.z);
+            glVertex3d(wall_end.x, wall_start.y, wall_start.z);
+            glVertex3d(wall_end.x, wall_start.y, wall_start.z);
+            glVertex3d(wall_end.x, wall_end.y, wall_start.z);
+            glVertex3d(wall_end.x, wall_end.y, wall_start.z);
+            glVertex3d(wall_start.x, wall_end.y, wall_start.z);
+            glVertex3d(wall_start.x, wall_end.y, wall_start.z);
+            glVertex3d(wall_start.x, wall_start.y, wall_start.z);
+        }
+        glEnd();
+    }
     glLineWidth(1.0F);
 }
 
@@ -742,20 +996,79 @@ void draw_molecules(const RECT& client_area)
         {
             continue;
         }
-        draw_sphere(position, molecule_radius, false,
-            static_cast<std::uint64_t>(index + 1) == selected_molecule_id,
+        const bool selected =
+            static_cast<std::uint64_t>(index + 1) == selected_molecule_id ||
+            std::find(selected_particles.begin(), selected_particles.end(),
+                index) != selected_particles.end();
+        draw_sphere(position, molecule_radius, false, selected,
             particles[index].charge);
     }
 
     Vec3 preview_position{};
+    const double preview_z = simulation_engine.config().two_dimensional
+        ? 0.0 : molecule_placement_height;
     if (molecule_tool_active && pointer_over_scene &&
         screen_to_plane(client_area, pointer_position,
-            molecule_placement_height, preview_position))
+            preview_z, preview_position))
     {
         draw_sphere(
-            Vec3{preview_position.x, preview_position.y, molecule_placement_height},
+            Vec3{preview_position.x, preview_position.y, preview_z},
             molecule_radius, true);
     }
+}
+
+void draw_square_lattice_preview()
+{
+    if (!square_lattice_dragging)
+    {
+        return;
+    }
+    glDisable(GL_LIGHTING);
+    glLineWidth(2.0F);
+    glColor3ub(69, 214, 201);
+    const double dx = square_lattice_end.x - square_lattice_start.x;
+    const double dy = square_lattice_end.y - square_lattice_start.y;
+    const double side = (std::max)(std::abs(dx), std::abs(dy));
+    const double direction_x = dx < 0.0 ? -1.0 : 1.0;
+    const double direction_y = dy < 0.0 ? -1.0 : 1.0;
+    const double end_x = square_lattice_start.x + direction_x * side;
+    const double end_y = square_lattice_start.y + direction_y * side;
+    glBegin(GL_LINE_LOOP);
+    glVertex3d(square_lattice_start.x, square_lattice_start.y,
+        square_lattice_start.z);
+    glVertex3d(end_x, square_lattice_start.y,
+        square_lattice_start.z);
+    glVertex3d(end_x, end_y,
+        square_lattice_start.z);
+    glVertex3d(square_lattice_start.x, end_y,
+        square_lattice_start.z);
+    glEnd();
+
+    const std::size_t columns = static_cast<std::size_t>(
+        std::ceil(std::sqrt(static_cast<double>(square_lattice_count))));
+    const std::size_t rows =
+        (square_lattice_count + columns - 1) / columns;
+    const double spacing = side /
+        static_cast<double>((std::max)(columns, rows));
+    const double center_x = (square_lattice_start.x + end_x) * 0.5;
+    const double center_y = (square_lattice_start.y + end_y) * 0.5;
+    const double start_x = center_x -
+        spacing * static_cast<double>(columns - 1) * 0.5;
+    const double start_y = center_y -
+        spacing * static_cast<double>(rows - 1) * 0.5;
+    glPointSize(5.0F);
+    glBegin(GL_POINTS);
+    for (std::size_t index = 0; index < square_lattice_count; ++index)
+    {
+        const std::size_t column = index % columns;
+        const std::size_t row = index / columns;
+        glVertex3d(start_x + static_cast<double>(column) * spacing,
+            start_y + static_cast<double>(row) * spacing,
+            square_lattice_start.z);
+    }
+    glEnd();
+    glPointSize(1.0F);
+    glLineWidth(1.0F);
 }
 
 void draw_bonds()
@@ -848,8 +1161,10 @@ void render_scene(const RECT& client_area)
 
     draw_grid();
     draw_simulation_boundaries();
+    draw_walls();
     draw_bonds();
     draw_molecules(client_area);
+    draw_square_lattice_preview();
     draw_interaction_force();
 
     glDisable(GL_LIGHTING);
@@ -860,8 +1175,7 @@ void render_scene(const RECT& client_area)
 void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     HFONT small_font, HFONT button_font, HFONT status_font)
 {
-    RECT toolbar{client_area.left, client_area.top, client_area.right,
-        client_area.top + toolbar_height};
+    const RECT toolbar = toolbar_area(client_area);
     fill_rectangle(device_context, toolbar, toolbar_color);
     draw_line(device_context, client_area.left, toolbar.bottom - 1,
         client_area.right, toolbar.bottom - 1, border_color);
@@ -875,6 +1189,22 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     RECT subtitle_area{50, toolbar.top + 34, 245, toolbar.top + 51};
     draw_text(device_context, L"3D MOLECULAR SPACE", subtitle_area,
         muted_text_color, small_font);
+
+    const RECT help_button = help_tool_area(client_area);
+    HPEN help_pen = CreatePen(PS_SOLID, 1, border_color);
+    HBRUSH help_brush = CreateSolidBrush(RGB(20, 27, 39));
+    HPEN previous_help_pen =
+        static_cast<HPEN>(SelectObject(device_context, help_pen));
+    HBRUSH previous_help_brush =
+        static_cast<HBRUSH>(SelectObject(device_context, help_brush));
+    RoundRect(device_context, help_button.left, help_button.top,
+        help_button.right, help_button.bottom, 8, 8);
+    SelectObject(device_context, previous_help_brush);
+    SelectObject(device_context, previous_help_pen);
+    DeleteObject(help_brush);
+    DeleteObject(help_pen);
+    draw_text(device_context, L"?", help_button, x_axis_color,
+        button_font, DT_CENTER);
 
     const RECT molecule_button = molecule_tool_area(client_area);
     HPEN button_pen = CreatePen(PS_SOLID, 1,
@@ -937,35 +1267,29 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         simulation_running ? x_axis_color : primary_text_color,
         button_font, DT_CENTER);
 
-    const auto& config = simulation_engine.config();
-    const wchar_t* thermostat_label = L"OFF";
-    switch (config.thermostat)
-    {
-    case simulation::Thermostat::andersen:
-        thermostat_label = L"AND";
-        break;
-    case simulation::Thermostat::berendsen:
-        thermostat_label = L"BER";
-        break;
-    case simulation::Thermostat::acceleration_damping:
-        thermostat_label = L"DAMP";
-        break;
-    case simulation::Thermostat::none:
-        break;
-    }
-    wchar_t model_label[48]{};
-    std::swprintf(model_label, sizeof(model_label) / sizeof(model_label[0]),
-        L"%ls  %ls  %ls  %.2f",
-        config.integrator == simulation::Integrator::velocity_verlet
-            ? L"VV" : L"KDK",
-        thermostat_label,
-        config.coulomb_solver == simulation::CoulombSolver::direct
-            ? L"COUL" : L"TREE",
-        config.target_temperature);
-    draw_text(device_context, model_label,
-        RECT{client_area.left + 554, toolbar.top + 16,
-            client_area.left + 648, toolbar.top + 46},
+    const RECT time_slider = time_flow_slider_area(client_area);
+    wchar_t time_flow_label[24]{};
+    std::swprintf(time_flow_label,
+        sizeof(time_flow_label) / sizeof(time_flow_label[0]),
+        L"TIME  %.2fx", time_flow_factor);
+    draw_text(device_context, time_flow_label,
+        RECT{time_slider.left, time_slider.top,
+            time_slider.right, time_slider.top + 19},
         muted_text_color, small_font, DT_CENTER);
+    const int slider_left = time_slider.left + 8;
+    const int slider_right = time_slider.right - 8;
+    const int slider_y = time_slider.top + 31;
+    draw_line(device_context, slider_left, slider_y, slider_right,
+        slider_y, border_color, 3);
+    const double normalized_speed =
+        (time_flow_factor - minimum_time_flow_factor) /
+        (maximum_time_flow_factor - minimum_time_flow_factor);
+    const int slider_x = slider_left + static_cast<int>(
+        normalized_speed * (slider_right - slider_left));
+    draw_line(device_context, slider_left, slider_y, slider_x,
+        slider_y, x_axis_color, 3);
+    draw_filled_circle(device_context, slider_x, slider_y, 5,
+        primary_text_color, x_axis_color);
 
     const RECT graphics_button = graphics_tool_area(client_area);
     HPEN graphics_pen = CreatePen(PS_SOLID, 1, border_color);
@@ -1067,13 +1391,16 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
     }
     draw_filled_circle(device_context, client_area.right - 42,
         brand_center_y, 5, RGB(22, 53, 64), x_axis_color);
+    draw_line(device_context, client_area.right - 25, toolbar.top + 24,
+        client_area.right - 13, toolbar.top + 36, muted_text_color);
+    draw_line(device_context, client_area.right - 13, toolbar.top + 24,
+        client_area.right - 25, toolbar.top + 36, muted_text_color);
 }
 
 void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     HFONT status_font)
 {
-    RECT footer{client_area.left, client_area.bottom - footer_height,
-        client_area.right, client_area.bottom};
+    const RECT footer = footer_area(client_area);
     fill_rectangle(device_context, footer, footer_color);
     draw_line(device_context, client_area.left, footer.top,
         client_area.right, footer.top, border_color);
@@ -1224,6 +1551,10 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     draw_text(device_context, L"THERMODYNAMICS",
         RECT{16, footer.top + 3, client_area.right - 16, footer.top + 17},
         muted_text_color, small_font);
+    draw_line(device_context, client_area.right - 24, footer.top + 7,
+        client_area.right - 14, footer.top + 17, muted_text_color);
+    draw_line(device_context, client_area.right - 14, footer.top + 7,
+        client_area.right - 24, footer.top + 17, muted_text_color);
     for (int index = 0; index < thermodynamic_count; ++index)
     {
         const int left = client_area.left + index * thermodynamic_width;
@@ -1299,7 +1630,7 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         ? L"SELECT MOLECULE   HOLD+DRAG TO APPLY FORCE"
         : interaction_tool == InteractionTool::spring_drag
         ? L"SELECT MOLECULE   DRAG WITH SPRING FORCE"
-        : L"WASD/QE MOVE   RMB ORBIT   MMB PAN   WHEEL ZOOM   SPACE SIM";
+        : L"F1 HELP   F2 PANELS   WASD/QE MOVE   RMB ORBIT   MMB PAN   WHEEL ZOOM   SPACE SIM";
     draw_text(device_context, hint, instructions, muted_text_color, small_font);
 
     wchar_t coordinates[3][32]{};
@@ -1345,16 +1676,162 @@ void draw_footer_overlay(HDC device_context, const RECT& client_area)
     }
 }
 
+void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
+{
+    if (!tools_panel_visible)
+    {
+        return;
+    }
+    const RECT panel = tools_panel_area(client_area);
+    fill_rectangle(device_context, panel, toolbar_color);
+    draw_line(device_context, panel.left, panel.top,
+        panel.left, panel.bottom, border_color);
+    draw_line(device_context, panel.left, panel.top + 38,
+        panel.right, panel.top + 38, border_color);
+    draw_text(device_context, L"TOOLS",
+        RECT{panel.left + 16, panel.top + 10, panel.right - 48, panel.top + 30},
+        primary_text_color, button_font);
+    draw_line(device_context, panel.right - 25, panel.top + 13,
+        panel.right - 13, panel.top + 25, muted_text_color);
+    draw_line(device_context, panel.right - 13, panel.top + 13,
+        panel.right - 25, panel.top + 25, muted_text_color);
+
+    const auto draw_tool_button = [device_context](const RECT& area,
+                                      const wchar_t* label, bool active) {
+        fill_rectangle(device_context, area,
+            active ? RGB(26, 55, 61) : RGB(20, 27, 39));
+        draw_line(device_context, area.left, area.top,
+            area.right, area.top, border_color);
+        draw_line(device_context, area.left, area.bottom - 1,
+            area.right, area.bottom - 1, border_color);
+        draw_line(device_context, area.left, area.top,
+            area.left, area.bottom, border_color);
+        draw_line(device_context, area.right - 1, area.top,
+            area.right - 1, area.bottom, border_color);
+        draw_text(device_context, label,
+            RECT{area.left + 5, area.top, area.right - 5, area.bottom},
+            active ? x_axis_color : primary_text_color,
+            small_font, DT_CENTER);
+    };
+    bool has_tool_selection = false;
+    bool selection_is_frozen = true;
+    const auto& particles = simulation_engine.particles();
+    if (selected_particles.empty())
+    {
+        if (selected_molecule_id > 0 &&
+            selected_molecule_id <= particles.size())
+        {
+            has_tool_selection = true;
+            selection_is_frozen =
+                particles[static_cast<std::size_t>(selected_molecule_id - 1)]
+                    .fixed;
+        }
+    }
+    else
+    {
+        for (const std::size_t index : selected_particles)
+        {
+            if (index < particles.size())
+            {
+                has_tool_selection = true;
+                selection_is_frozen =
+                    selection_is_frozen && particles[index].fixed;
+            }
+        }
+    }
+    draw_tool_button(tools_panel_button_area(client_area, 0),
+        has_tool_selection && selection_is_frozen
+            ? L"РАЗМОРОЗИТЬ ВЫБРАННЫЕ"
+            : L"ЗАМОРОЗИТЬ ВЫБРАННЫЕ",
+        has_tool_selection && selection_is_frozen);
+    draw_tool_button(tools_panel_button_area(client_area, 1),
+        molecular_tool == MolecularTool::multi_select
+            ? L"ВЫБОР ГРУППЫ: ВКЛ" : L"ВЫБОР НЕСКОЛЬКИХ",
+        molecular_tool == MolecularTool::multi_select);
+    wchar_t lattice_label[48]{};
+    std::swprintf(lattice_label,
+        sizeof(lattice_label) / sizeof(lattice_label[0]),
+        L"КВАДРАТНАЯ РЕШЁТКА (%llu)",
+        static_cast<unsigned long long>(square_lattice_count));
+    draw_tool_button(tools_panel_button_area(client_area, 2),
+        lattice_label, molecular_tool == MolecularTool::square_lattice);
+    draw_tool_button(tools_panel_button_area(client_area, 3),
+        L"СЦЕНАРИЙ: ДОБАВИТЬ ШАГ", false);
+    draw_tool_button(tools_panel_button_area(client_area, 4),
+        scenario_running ? L"ОСТАНОВИТЬ СЦЕНАРИЙ" :
+            L"ЗАПУСТИТЬ СЦЕНАРИЙ",
+        scenario_running);
+    draw_tool_button(tools_panel_button_area(client_area, 5),
+        L"ОЧИСТИТЬ СЦЕНАРИЙ", false);
+    draw_tool_button(tools_panel_button_area(client_area, 6),
+        wall_tool_active
+            ? L"СТЕНА: ПРОТЯНИТЕ"
+            : simulation_engine.config().two_dimensional
+            ? L"СТЕНА: ЛИНИЯ 2D" : L"СТЕНА: ПЛОСКОСТЬ 3D",
+        wall_tool_active);
+    draw_tool_button(tools_panel_button_area(client_area, 7),
+        simulation_engine.config().two_dimensional
+            ? L"РАЗМЕРНОСТЬ: 2D → 3D"
+            : L"РАЗМЕРНОСТЬ: 3D → 2D",
+        simulation_engine.config().two_dimensional);
+
+    wchar_t selection_label[48]{};
+    std::swprintf(selection_label,
+        sizeof(selection_label) / sizeof(selection_label[0]),
+        L"ВЫБРАНО: %llu",
+        static_cast<unsigned long long>(selected_particles.empty() &&
+                selected_molecule_id != 0 ? 1 : selected_particles.size()));
+    draw_text(device_context, selection_label,
+        RECT{panel.left + 12, panel.top + 294,
+            panel.right - 12, panel.top + 316},
+        muted_text_color, small_font);
+    if (!scenario_steps.empty())
+    {
+        wchar_t scenario_label[48]{};
+        std::swprintf(scenario_label,
+            sizeof(scenario_label) / sizeof(scenario_label[0]),
+            L"ШАГОВ СЦЕНАРИЯ: %llu",
+            static_cast<unsigned long long>(scenario_steps.size()));
+        draw_text(device_context, scenario_label,
+            RECT{panel.left + 12, panel.top + 316,
+                panel.right - 12, panel.top + 338},
+            muted_text_color, small_font);
+    }
+}
+
 void draw_overlay(HDC device_context, const RECT& client_area)
 {
-    draw_toolbar_overlay(device_context, client_area);
-    draw_footer_overlay(device_context, client_area);
+    if (separate_interface_windows)
+    {
+        return;
+    }
+    if (toolbar_visible)
+    {
+        draw_toolbar_overlay(device_context, client_area);
+    }
+    if (footer_visible)
+    {
+        draw_footer_overlay(device_context, client_area);
+    }
+    draw_tools_panel_overlay(device_context, client_area);
 }
 
 bool set_window_long_checked(HWND window, int index, LONG_PTR value);
+void set_separate_interface_windows(HWND window, bool enabled);
+void show_detached_settings_window(HWND owner);
+void show_chart_window(HWND owner);
+void show_graphics_menu(HWND window, bool force_popup = false);
 
 void toggle_fullscreen(HWND window)
 {
+    if (separate_interface_windows)
+    {
+        MessageBoxW(window,
+            L"Полноэкранный режим отключён, пока панели и инструменты "
+            L"находятся в отдельном окне. Сначала объедините окна.",
+            L"Bonderium", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     if (!fullscreen)
     {
         windowed_placement.length = sizeof(windowed_placement);
@@ -1507,7 +1984,7 @@ bool update_process_memory_usage()
     return true;
 }
 
-bool ram_budget_allows_molecule(HWND window)
+bool ram_budget_allows_molecule(HWND window, std::size_t additional_count = 1)
 {
     if (ram_budget_bytes == 0)
     {
@@ -1516,7 +1993,8 @@ bool ram_budget_allows_molecule(HWND window)
     if (!update_process_memory_usage())
     {
         MessageBoxW(window,
-            L"Unable to measure memory usage. The molecule was not added "
+            L"Unable to measure memory usage. The requested particles were "
+            L"not added "
             L"because a RAM budget is active.",
             L"Memory budget", MB_OK | MB_ICONERROR);
         return false;
@@ -1533,17 +2011,19 @@ bool ram_budget_allows_molecule(HWND window)
                 particle_count);
     constexpr std::uint64_t estimated_particle_bytes = 1024;
     constexpr std::uint64_t estimated_neighbor_pair_bytes = 16;
-    const std::uint64_t projected_bytes = process_private_bytes +
+    const std::uint64_t estimated_bytes_per_molecule =
         estimated_particle_bytes +
         estimated_neighbors * estimated_neighbor_pair_bytes;
+    const std::uint64_t projected_bytes = process_private_bytes +
+        estimated_bytes_per_molecule * additional_count;
     if (projected_bytes <= ram_budget_bytes)
     {
         return true;
     }
 
     MessageBoxW(window,
-        L"Adding this molecule would exceed the configured RAM budget. "
-        L"Increase the budget in OPT or remove molecules.",
+        L"Adding the requested molecule(s) would exceed the configured RAM "
+        L"budget. Increase the budget in OPT or remove molecules.",
         L"Memory budget reached", MB_OK | MB_ICONWARNING);
     return false;
 }
@@ -1767,8 +2247,14 @@ bool set_window_long_checked(HWND window, int index, LONG_PTR value)
     return GetLastError() == ERROR_SUCCESS;
 }
 
-void show_graphics_menu(HWND window)
+void show_graphics_menu(HWND window, bool force_popup)
 {
+    if (separate_interface_windows && !force_popup)
+    {
+        show_detached_settings_window(window);
+        return;
+    }
+
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr)
     {
@@ -1778,6 +2264,10 @@ void show_graphics_menu(HWND window)
     }
 
     UINT fullscreen_flags = MF_STRING;
+    if (separate_interface_windows)
+    {
+        fullscreen_flags |= MF_DISABLED | MF_GRAYED;
+    }
     if (fullscreen)
     {
         fullscreen_flags |= MF_CHECKED;
@@ -1814,6 +2304,16 @@ void show_graphics_menu(HWND window)
     const bool menu_ready =
         AppendMenuW(menu, fullscreen_flags, menu_toggle_fullscreen,
             L"Fullscreen  (F11)") &&
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
+        AppendMenuW(menu, MF_STRING |
+                (separate_interface_windows ? MF_CHECKED : 0),
+            menu_separate_interface,
+            L"Панели и инструменты в отдельном окне") &&
+        AppendMenuW(menu, MF_STRING |
+                (separate_interface_windows ? 0 : MF_GRAYED),
+            menu_open_detached_settings, L"Открыть отдельное окно настроек") &&
+        AppendMenuW(menu, MF_STRING, menu_open_charts,
+            L"Окно графиков и записи данных") &&
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
         AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"Rendering quality") &&
         AppendMenuW(menu, quality_performance_flags,
@@ -1864,6 +2364,15 @@ void show_graphics_menu(HWND window)
     {
     case menu_toggle_fullscreen:
         toggle_fullscreen(window);
+        break;
+    case menu_separate_interface:
+        set_separate_interface_windows(window, !separate_interface_windows);
+        break;
+    case menu_open_detached_settings:
+        show_detached_settings_window(window);
+        break;
+    case menu_open_charts:
+        show_chart_window(window);
         break;
     case menu_quality_performance:
         graphics_quality = GraphicsQuality::performance;
@@ -1917,6 +2426,702 @@ void show_graphics_menu(HWND window)
     }
 }
 
+void show_panels_menu(HWND window)
+{
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
+    {
+        MessageBoxW(window, L"Unable to open panel visibility settings.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const bool menu_ready =
+        AppendMenuW(menu, MF_STRING |
+                (toolbar_visible ? MF_CHECKED : 0),
+            menu_panel_toolbar, L"Top toolbar") &&
+        AppendMenuW(menu, MF_STRING |
+                (footer_visible ? MF_CHECKED : 0),
+            menu_panel_footer, L"Bottom status panel") &&
+        AppendMenuW(menu, MF_STRING |
+                (tools_panel_visible ? MF_CHECKED : 0),
+            menu_panel_tools, L"Tools panel");
+    if (!menu_ready)
+    {
+        DestroyMenu(menu);
+        MessageBoxW(window, L"Unable to build panel visibility settings.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    POINT menu_position{};
+    GetCursorPos(&menu_position);
+    SetForegroundWindow(window);
+    const UINT command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        menu_position.x, menu_position.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    switch (command)
+    {
+    case menu_panel_toolbar:
+        toolbar_visible = !toolbar_visible;
+        break;
+    case menu_panel_footer:
+        footer_visible = !footer_visible;
+        break;
+    case menu_panel_tools:
+        tools_panel_visible = !tools_panel_visible;
+        break;
+    default:
+        return;
+    }
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+void resize_detached_interface_window(HWND window)
+{
+    if (detached_interface_window == nullptr)
+    {
+        return;
+    }
+
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    RECT outer_area{0, 0, client_area.right, 500};
+    const DWORD style = static_cast<DWORD>(
+        GetWindowLongPtrW(detached_interface_window, GWL_STYLE));
+    const DWORD extended_style = static_cast<DWORD>(
+        GetWindowLongPtrW(detached_interface_window, GWL_EXSTYLE));
+    if (!AdjustWindowRectEx(&outer_area, style, FALSE, extended_style))
+    {
+        MessageBoxW(window,
+            L"Не удалось изменить размер отдельного окна панелей.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const int width = outer_area.right - outer_area.left;
+    const int height = outer_area.bottom - outer_area.top;
+    RECT main_rect{};
+    if (!GetWindowRect(window, &main_rect))
+    {
+        MessageBoxW(window,
+            L"Не удалось определить положение главного окна.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const HMONITOR monitor =
+        MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!GetMonitorInfoW(monitor, &monitor_info))
+    {
+        MessageBoxW(window,
+            L"Не удалось определить рабочую область экрана.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const int work_left = static_cast<int>(monitor_info.rcWork.left);
+    const int work_top = static_cast<int>(monitor_info.rcWork.top);
+    const int work_right = static_cast<int>(monitor_info.rcWork.right);
+    const int work_bottom = static_cast<int>(monitor_info.rcWork.bottom);
+    int left = main_rect.right + 8;
+    if (left + width > work_right)
+    {
+        const int left_of_main = main_rect.left - width - 8;
+        left = left_of_main >= work_left
+            ? left_of_main
+            : (std::max)(work_left, work_right - width);
+    }
+    left = (std::clamp)(left, work_left,
+        (std::max)(work_left, work_right - width));
+    const int top = (std::clamp)(static_cast<int>(main_rect.top), work_top,
+        (std::max)(work_top, work_bottom - height));
+    if (!SetWindowPos(detached_interface_window, HWND_TOP, left, top,
+            width, height, SWP_NOACTIVATE))
+    {
+        MessageBoxW(window,
+            L"Не удалось синхронизировать размер окна панелей.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+    }
+}
+
+LRESULT CALLBACK detached_interface_procedure(
+    HWND window, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    if (message == WM_ERASEBKGND)
+    {
+        return 1;
+    }
+    if (message == WM_CREATE)
+    {
+        SetTimer(window, 1, 300, nullptr);
+        return 0;
+    }
+    if (message == WM_TIMER)
+    {
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_PAINT)
+    {
+        PAINTSTRUCT paint{};
+        HDC context = BeginPaint(window, &paint);
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        fill_rectangle(context, client_area, canvas_color);
+        if (toolbar_visible)
+        {
+            draw_toolbar_overlay(context, client_area);
+        }
+        if (tools_panel_visible)
+        {
+            draw_tools_panel_overlay(context, client_area);
+        }
+        if (footer_visible)
+        {
+            draw_footer_overlay(context, client_area);
+        }
+        EndPaint(window, &paint);
+        return 0;
+    }
+    if (message == WM_LBUTTONDOWN)
+    {
+        if (main_window == nullptr)
+        {
+            return 0;
+        }
+        const POINT position{
+            static_cast<short>(LOWORD(l_param)),
+            static_cast<short>(HIWORD(l_param))};
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const RECT toolbar = toolbar_area(client_area);
+        const RECT tools = tools_panel_area(client_area);
+        const bool on_toolbar = toolbar_visible &&
+            PtInRect(&toolbar, position);
+        const bool on_tools = tools_panel_visible &&
+            PtInRect(&tools, position);
+        const RECT footer = footer_area(client_area);
+        const bool on_footer = footer_visible &&
+            PtInRect(&footer, position);
+        if (!on_toolbar && !on_tools && !on_footer)
+        {
+            return 0;
+        }
+        if (on_footer)
+        {
+            const RECT close_button{
+                footer.right - 34, footer.top,
+                footer.right - 4, footer.top + 24};
+            if (PtInRect(&close_button, position))
+            {
+                footer_visible = false;
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+        }
+        SendMessageW(main_window, WM_LBUTTONDOWN, w_param, l_param);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_KEYDOWN && main_window != nullptr)
+    {
+        SendMessageW(main_window, message, w_param, l_param);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_CLOSE)
+    {
+        set_separate_interface_windows(main_window, false);
+        return 0;
+    }
+    if (message == WM_DESTROY)
+    {
+        KillTimer(window, 1);
+        if (detached_interface_window == window)
+        {
+            detached_interface_window = nullptr;
+        }
+        return 0;
+    }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
+
+LRESULT CALLBACK detached_settings_procedure(
+    HWND window, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    if (message == WM_ERASEBKGND)
+    {
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        if (detached_settings_background != nullptr)
+        {
+            FillRect(reinterpret_cast<HDC>(w_param), &client_area,
+                detached_settings_background);
+        }
+        return 1;
+    }
+    if (message == WM_CREATE)
+    {
+        detached_settings_background = CreateSolidBrush(toolbar_color);
+        if (detached_settings_background == nullptr)
+        {
+            return -1;
+        }
+        if (CreateWindowExW(0, L"STATIC",
+                L"Сцена остаётся в отдельном оконном режиме.",
+            WS_CHILD | WS_VISIBLE, 18, 18, 500, 24, window, nullptr,
+                GetModuleHandleW(nullptr), nullptr) == nullptr ||
+            CreateWindowExW(0, L"STATIC",
+                L"Полный экран недоступен, пока окна не объединены.",
+            WS_CHILD | WS_VISIBLE, 18, 46, 500, 24, window, nullptr,
+                GetModuleHandleW(nullptr), nullptr) == nullptr ||
+            CreateWindowExW(0, L"BUTTON", L"Настройки графики...",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            18, 92, 155, 32, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(102)),
+                GetModuleHandleW(nullptr), nullptr) == nullptr ||
+        CreateWindowExW(0, L"BUTTON", L"Окно графиков",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            182, 92, 145, 32, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(103)),
+            GetModuleHandleW(nullptr), nullptr) == nullptr ||
+        CreateWindowExW(0, L"BUTTON", L"Объединить окна",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            336, 92, 170, 32, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(101)),
+                GetModuleHandleW(nullptr), nullptr) == nullptr)
+        {
+            return -1;
+        }
+        return 0;
+    }
+    if (message == WM_CTLCOLORSTATIC)
+    {
+        HDC context = reinterpret_cast<HDC>(w_param);
+        SetTextColor(context, primary_text_color);
+        SetBkColor(context, toolbar_color);
+        return reinterpret_cast<LRESULT>(detached_settings_background);
+    }
+    if (message == WM_DRAWITEM)
+    {
+        const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
+        fill_rectangle(item->hDC, item->rcItem, RGB(20, 27, 39));
+        draw_line(item->hDC, item->rcItem.left, item->rcItem.top,
+            item->rcItem.right, item->rcItem.top, border_color);
+        draw_line(item->hDC, item->rcItem.left, item->rcItem.bottom - 1,
+            item->rcItem.right, item->rcItem.bottom - 1, border_color);
+        draw_line(item->hDC, item->rcItem.left, item->rcItem.top,
+            item->rcItem.left, item->rcItem.bottom, border_color);
+        draw_line(item->hDC, item->rcItem.right - 1, item->rcItem.top,
+            item->rcItem.right - 1, item->rcItem.bottom, border_color);
+        wchar_t label[80]{};
+        GetWindowTextW(item->hwndItem, label,
+            static_cast<int>(std::size(label)));
+        SetBkMode(item->hDC, TRANSPARENT);
+        SetTextColor(item->hDC, primary_text_color);
+        HFONT previous_font = nullptr;
+        if (button_font != nullptr)
+        {
+            previous_font = static_cast<HFONT>(
+                SelectObject(item->hDC, button_font));
+        }
+        RECT text_area = item->rcItem;
+        DrawTextW(item->hDC, label, -1, &text_area,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (previous_font != nullptr)
+        {
+            SelectObject(item->hDC, previous_font);
+        }
+        return TRUE;
+    }
+    if (message == WM_COMMAND)
+    {
+        switch (LOWORD(w_param))
+        {
+        case 101:
+            set_separate_interface_windows(main_window, false);
+            return 0;
+        case 102:
+            if (main_window != nullptr)
+            {
+                show_graphics_menu(main_window, true);
+            }
+            return 0;
+        case 103:
+            if (main_window != nullptr)
+            {
+                show_chart_window(main_window);
+            }
+            return 0;
+        default:
+            break;
+        }
+    }
+    if (message == WM_CLOSE)
+    {
+        DestroyWindow(window);
+        return 0;
+    }
+    if (message == WM_DESTROY && detached_settings_window == window)
+    {
+        detached_settings_window = nullptr;
+        if (detached_settings_background != nullptr)
+        {
+            DeleteObject(detached_settings_background);
+            detached_settings_background = nullptr;
+        }
+        return 0;
+    }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
+
+void set_separate_interface_windows(HWND window, bool enabled)
+{
+    if (enabled == separate_interface_windows)
+    {
+        return;
+    }
+    if (!enabled)
+    {
+        separate_interface_windows = false;
+        if (detached_settings_window != nullptr)
+        {
+            DestroyWindow(detached_settings_window);
+            detached_settings_window = nullptr;
+        }
+        if (detached_interface_window != nullptr)
+        {
+            DestroyWindow(detached_interface_window);
+            detached_interface_window = nullptr;
+        }
+        if (window != nullptr)
+        {
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return;
+    }
+    if (window == nullptr)
+    {
+        return;
+    }
+    if (fullscreen)
+    {
+        toggle_fullscreen(window);
+        if (fullscreen)
+        {
+            return;
+        }
+    }
+
+    static bool interface_class_registered = false;
+    if (!interface_class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = detached_interface_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor =
+            LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground = nullptr;
+        window_class.lpszClassName = detached_interface_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(window,
+                L"Не удалось зарегистрировать окно панелей.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        interface_class_registered = true;
+    }
+
+    RECT main_rect{};
+    RECT client_area{};
+    GetWindowRect(window, &main_rect);
+    GetClientRect(window, &client_area);
+    RECT detached_rect{0, 0, client_area.right, 500};
+    if (!AdjustWindowRectEx(&detached_rect, WS_OVERLAPPEDWINDOW,
+            FALSE, 0))
+    {
+        MessageBoxW(window,
+            L"Не удалось определить размер окна панелей.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    detached_interface_window = CreateWindowExW(0,
+        detached_interface_class_name, L"Bonderium — панели и инструменты",
+        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
+        main_rect.right + 8, main_rect.top,
+        detached_rect.right - detached_rect.left,
+        detached_rect.bottom - detached_rect.top,
+        window, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (detached_interface_window == nullptr)
+    {
+        MessageBoxW(window,
+            L"Не удалось создать окно панелей.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    separate_interface_windows = true;
+    ShowWindow(detached_interface_window, SW_SHOW);
+    resize_detached_interface_window(window);
+    SetForegroundWindow(detached_interface_window);
+    BringWindowToTop(detached_interface_window);
+    InvalidateRect(window, nullptr, FALSE);
+    UpdateWindow(detached_interface_window);
+}
+
+void show_detached_settings_window(HWND owner)
+{
+    if (detached_settings_window != nullptr)
+    {
+        ShowWindow(detached_settings_window, SW_SHOW);
+        SetForegroundWindow(detached_settings_window);
+        return;
+    }
+
+    static bool settings_class_registered = false;
+    if (!settings_class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = detached_settings_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor =
+            LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground = nullptr;
+        window_class.lpszClassName = detached_settings_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(owner,
+                L"Unable to register the separate settings window.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return;
+        }
+        settings_class_registered = true;
+    }
+
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    detached_settings_window = CreateWindowExW(WS_EX_DLGMODALFRAME,
+        detached_settings_class_name, L"Bonderium — настройки окна",
+        WS_CAPTION | WS_SYSMENU | WS_POPUP,
+        owner_rect.left + 40, owner_rect.top + 40, 540, 180,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (detached_settings_window == nullptr)
+    {
+        MessageBoxW(owner,
+            L"Unable to create the separate settings window.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
+    ShowWindow(detached_settings_window, SW_SHOW);
+    UpdateWindow(detached_settings_window);
+}
+
+LRESULT CALLBACK input_dialog_procedure(
+    HWND dialog, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    auto* state = reinterpret_cast<InputDialogState*>(
+        GetWindowLongPtrW(dialog, GWLP_USERDATA));
+    if (message == WM_NCCREATE)
+    {
+        const auto* creation =
+            reinterpret_cast<const CREATESTRUCTW*>(l_param);
+        state = static_cast<InputDialogState*>(creation->lpCreateParams);
+        SetWindowLongPtrW(dialog, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr)
+    {
+        return DefWindowProcW(dialog, message, w_param, l_param);
+    }
+    if (message == WM_CREATE)
+    {
+        for (std::size_t index = 0; index < state->field_count; ++index)
+        {
+            const int top = 16 + static_cast<int>(index) * 54;
+            CreateWindowExW(0, L"STATIC", state->labels[index],
+                WS_CHILD | WS_VISIBLE, 18, top, 360, 20, dialog, nullptr,
+                GetModuleHandleW(nullptr), nullptr);
+            state->edits[index] = CreateWindowExW(WS_EX_CLIENTEDGE,
+                L"EDIT", state->values[index],
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                18, top + 22, 360, 25, dialog,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(101 + index)),
+                GetModuleHandleW(nullptr), nullptr);
+            if (state->edits[index] == nullptr)
+            {
+                return -1;
+            }
+        }
+        const int buttons_top =
+            24 + static_cast<int>(state->field_count) * 54;
+        if (CreateWindowExW(0, L"BUTTON", L"Применить",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                210, buttons_top, 80, 28, dialog,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)),
+                GetModuleHandleW(nullptr), nullptr) == nullptr ||
+            CreateWindowExW(0, L"BUTTON", L"Отмена",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                298, buttons_top, 80, 28, dialog,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)),
+                GetModuleHandleW(nullptr), nullptr) == nullptr)
+        {
+            return -1;
+        }
+        SetFocus(state->edits[0]);
+        return 0;
+    }
+    if (message == WM_COMMAND && LOWORD(w_param) == IDOK)
+    {
+        for (std::size_t index = 0; index < state->field_count; ++index)
+        {
+            GetWindowTextW(state->edits[index], state->values[index],
+                static_cast<int>(std::size(state->values[index])));
+        }
+        state->accepted = true;
+        state->done = true;
+        DestroyWindow(dialog);
+        return 0;
+    }
+    if ((message == WM_COMMAND && LOWORD(w_param) == IDCANCEL) ||
+        message == WM_CLOSE)
+    {
+        state->done = true;
+        DestroyWindow(dialog);
+        return 0;
+    }
+    return DefWindowProcW(dialog, message, w_param, l_param);
+}
+
+bool show_input_dialog(HWND owner, InputDialogState& state)
+{
+    static constexpr wchar_t dialog_class_name[] =
+        L"BonderiumInputDialog";
+    static bool class_registered = false;
+    if (!class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = input_dialog_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor =
+            LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground =
+            reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        window_class.lpszClassName = dialog_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(owner, L"Не удалось открыть окно ввода.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return false;
+        }
+        class_registered = true;
+    }
+
+    const int height = 90 + static_cast<int>(state.field_count) * 54;
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    const int left = owner_rect.left +
+        ((owner_rect.right - owner_rect.left) - 410) / 2;
+    const int top = owner_rect.top +
+        ((owner_rect.bottom - owner_rect.top) - height) / 2;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME,
+        dialog_class_name, state.title,
+        WS_CAPTION | WS_SYSMENU | WS_POPUP,
+        left, top, 410, height, owner, nullptr,
+        GetModuleHandleW(nullptr), &state);
+    if (dialog == nullptr)
+    {
+        MessageBoxW(owner, L"Не удалось создать окно ввода.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    EnableWindow(owner, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    MSG message{};
+    while (!state.done)
+    {
+        const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+        if (result == 0)
+        {
+            PostQuitMessage(static_cast<int>(message.wParam));
+            state.done = true;
+            break;
+        }
+        if (result == -1)
+        {
+            DestroyWindow(dialog);
+            EnableWindow(owner, TRUE);
+            MessageBoxW(owner, L"Окно ввода было неожиданно закрыто.",
+                L"Bonderium", MB_OK | MB_ICONERROR);
+            return false;
+        }
+        if (!IsDialogMessageW(dialog, &message))
+        {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    return state.accepted;
+}
+
+void show_help(HWND window)
+{
+    MessageBoxW(window,
+        L"ГОРЯЧИЕ КЛАВИШИ\n"
+        L"W A S D / стрелки  Перемещение камеры\n"
+        L"Q / E  Камера вниз / вверх (только 3D)\n"
+        L"Правая кнопка мыши + движение  Вращение камеры\n"
+        L"Средняя кнопка мыши + движение  Панорамирование\n"
+        L"Колесо мыши  Масштабирование\n"
+        L"Ползунок TIME  Скорость симуляционного времени, 0,25×–4×\n"
+        L"Home  Сброс камеры\n"
+        L"F11  Полноэкранный режим\n"
+        L"F2  Показать или скрыть панели\n"
+        L"F1  Открыть эту справку\n"
+        L"C  Разместить молекулу\n"
+        L"B  Создать связь между двумя молекулами\n"
+        L"Пробел  Запустить или приостановить симуляцию\n"
+        L"[ / ]  Изменить заряд выбранной молекулы\n"
+        L"Shift + [ / ]  Изменить целевую температуру\n"
+        L"Esc  Отменить размещение молекулы или создание связи\n"
+        L"2 / 3  Переключить размерность симуляции\n"
+        L"\nИНСТРУМЕНТЫ И НАСТРОЙКИ\n"
+        L"SELECT / SPRING / FORCE  Выбор режима взаимодействия\n"
+        L"OPT  Графика, сетка и бюджет оперативной памяти\n"
+        L"OPT → Окно графиков  Запись и сравнение измерений\n"
+        L"AUTO  Автоматический выбор графики для этого ПК\n"
+        L"RESTART  Перезапустить Bonderium\n"
+        L"\nИНСТРУМЕНТЫ И СЦЕНАРИИ\n"
+        L"На панели TOOLS включите выбор нескольких и щёлкайте молекулы, "
+        L"чтобы добавить их в группу или убрать из неё.\n"
+        L"Заморозка переключает выбранные молекулы между неподвижным и "
+        L"подвижным состоянием.\n"
+        L"Квадратная решётка запрашивает количество молекул; затем протяните "
+        L"квадрат в сцене для равномерного размещения.\n"
+        L"В сценарий можно добавить шаг силы для выбранных молекул или шаг "
+        L"создания решётки по нарисованному квадрату.\n"
+        L"Стена: протяните отрезок в 2D или прямоугольник в 3D; координаты "
+        L"стены привязываются к целым значениям.\n"
+        L"В 2D молекулы остаются в плоскости XY; переключатель размерности "
+        L"находится на панели TOOLS.\n"
+        L"Сценарий проигрывается по времени симуляции и хранится до закрытия.\n"
+        L"Крестик закрывает панель; клавиша F2 позволяет вернуть её.\n"
+        L"Бюджет памяти предупреждает о достижении порога и приостанавливает "
+        L"симуляцию, но не задаёт жёсткий лимит памяти Windows.",
+        L"Bonderium — Справка", MB_OK | MB_ICONINFORMATION);
+}
+
 void set_interaction_tool(HWND window, InteractionTool tool)
 {
     if (molecule_dragging)
@@ -1933,6 +3138,10 @@ void set_interaction_tool(HWND window, InteractionTool tool)
     interaction_tool = tool;
     molecule_tool_active = false;
     bond_tool_active = false;
+    wall_tool_active = false;
+    molecular_tool = MolecularTool::select;
+    square_lattice_dragging = false;
+    square_lattice_for_scenario = false;
     pending_bond_molecule_id = 0;
     invalidate_simulation_ui(window, true);
 }
@@ -2018,6 +3227,11 @@ void set_molecule_tool(HWND window, bool active)
 {
     molecule_tool_active = active;
     bond_tool_active = false;
+    wall_tool_active = false;
+    wall_dragging = false;
+    molecular_tool = MolecularTool::select;
+    square_lattice_dragging = false;
+    square_lattice_for_scenario = false;
     pending_bond_molecule_id = 0;
     pointer_over_scene = false;
     POINT cursor{};
@@ -2028,14 +3242,18 @@ void set_molecule_tool(HWND window, bool active)
     const RECT area = scene_area(client_area);
     const bool over_scene = active && PtInRect(&area, cursor);
     SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(over_scene ? 32515 : 32512)));
-    const RECT button_area = molecule_tool_area(client_area);
-    InvalidateRect(window, &button_area, FALSE);
-    const RECT simulation_button = simulation_tool_area(client_area);
-    InvalidateRect(window, &simulation_button, FALSE);
-    const RECT footer{
-        client_area.left, client_area.bottom - footer_height,
-        client_area.right, client_area.bottom};
-    InvalidateRect(window, &footer, FALSE);
+    if (toolbar_visible)
+    {
+        const RECT button_area = molecule_tool_area(client_area);
+        InvalidateRect(window, &button_area, FALSE);
+        const RECT simulation_button = simulation_tool_area(client_area);
+        InvalidateRect(window, &simulation_button, FALSE);
+    }
+    if (footer_visible)
+    {
+        const RECT footer = footer_area(client_area);
+        InvalidateRect(window, &footer, FALSE);
+    }
     if (over_scene)
     {
         InvalidateRect(window, &area, FALSE);
@@ -2045,14 +3263,20 @@ void set_molecule_tool(HWND window, bool active)
 void set_bond_tool(HWND window, bool active)
 {
     bond_tool_active = active;
+    wall_tool_active = false;
+    wall_dragging = false;
     pending_bond_molecule_id = 0;
     molecule_tool_active = false;
+    molecular_tool = MolecularTool::select;
+    square_lattice_dragging = false;
+    square_lattice_for_scenario = false;
     pointer_over_scene = false;
     SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
     invalidate_simulation_ui(window, true);
 }
 
 void stop_molecule_interaction(HWND window);
+void stop_scenario(HWND window);
 
 void set_simulation_running(HWND window, bool running)
 {
@@ -2068,6 +3292,10 @@ void set_simulation_running(HWND window, bool running)
     if (!running && molecule_dragging)
     {
         stop_molecule_interaction(window);
+    }
+    if (!running)
+    {
+        stop_scenario(window);
     }
     simulation_running = running;
     simulation_time_accumulator = 0.0;
@@ -2163,6 +3391,1030 @@ void stop_molecule_interaction(HWND window)
     invalidate_simulation_ui(window, true);
 }
 
+std::vector<std::size_t> current_selection()
+{
+    if (!selected_particles.empty())
+    {
+        return selected_particles;
+    }
+    if (selected_molecule_id > 0 &&
+        selected_molecule_id <= simulation_engine.particles().size())
+    {
+        return {static_cast<std::size_t>(selected_molecule_id - 1)};
+    }
+    return {};
+}
+
+void capture_chart_particle_selection()
+{
+    chart_particle_indices.clear();
+    const std::vector<std::size_t> selection = current_selection();
+    for (const std::size_t index : selection)
+    {
+        if (index < simulation_engine.particles().size() &&
+            chart_particle_indices.size() < maximum_chart_particles)
+        {
+            chart_particle_indices.push_back(index);
+        }
+    }
+    if (chart_particle_indices.empty())
+    {
+        const auto& particles = simulation_engine.particles();
+        for (std::size_t index = 0;
+            index < particles.size() &&
+                chart_particle_indices.size() < maximum_chart_particles;
+            ++index)
+        {
+            chart_particle_indices.push_back(index);
+        }
+    }
+    chart_selection_initialized = true;
+}
+
+double sample_particle_quantity(const ChartSample& sample,
+    std::size_t particle_slot, std::size_t quantity)
+{
+    if (quantity == 0)
+    {
+        return sample.particle_values[particle_slot][0];
+    }
+    if (quantity >= 2 && quantity <= 8)
+    {
+        return sample.particle_values[particle_slot][quantity - 1];
+    }
+    return 0.0;
+}
+
+double chart_sample_value(std::size_t sample_index,
+    std::size_t particle_slot, std::size_t quantity)
+{
+    if (sample_index >= chart_sample_count || chart_samples.empty())
+    {
+        return 0.0;
+    }
+    const std::size_t oldest =
+        (chart_next_sample + chart_sample_capacity - chart_sample_count) %
+        chart_sample_capacity;
+    const std::size_t ring_index =
+        (oldest + sample_index) % chart_sample_capacity;
+    const ChartSample& sample = chart_samples[ring_index];
+    if (quantity == 1)
+    {
+        if (sample_index == 0)
+        {
+            return 0.0;
+        }
+        const std::size_t previous_index =
+            (ring_index + chart_sample_capacity - 1) % chart_sample_capacity;
+        const ChartSample& previous = chart_samples[previous_index];
+        const double elapsed = sample.time - previous.time;
+        return elapsed > 0.0
+            ? (sample.particle_values[particle_slot][0] -
+                previous.particle_values[particle_slot][0]) / elapsed
+            : 0.0;
+    }
+    if (quantity >= 9)
+    {
+        return sample.system_values[quantity - 9];
+    }
+    return sample_particle_quantity(sample, particle_slot, quantity);
+}
+
+void record_chart_sample()
+{
+    if (chart_window == nullptr || !chart_recording ||
+        chart_samples.size() != chart_sample_capacity ||
+        simulation_engine.metrics().steps % chart_sample_step_stride != 0 ||
+        chart_last_recorded_step == simulation_engine.metrics().steps)
+    {
+        return;
+    }
+
+    ChartSample sample;
+    const auto& metrics = simulation_engine.metrics();
+    const double time_step = simulation_engine.config().time_step;
+    sample.time = static_cast<double>(metrics.steps) * time_step;
+    sample.system_values = {
+        metrics.kinetic_energy,
+        metrics.potential_energy,
+        metrics.total_energy,
+        metrics.temperature,
+        metrics.pressure};
+    const auto& particles = simulation_engine.particles();
+    for (std::size_t slot = 0;
+        slot < chart_particle_indices.size() &&
+            slot < maximum_chart_particles;
+        ++slot)
+    {
+        const std::size_t index = chart_particle_indices[slot];
+        if (index >= particles.size())
+        {
+            continue;
+        }
+        const simulation::Particle& particle = particles[index];
+        const double speed = std::sqrt(dot(particle.velocity, particle.velocity));
+        sample.particle_values[slot] = {
+            speed,
+            particle.position.x,
+            particle.position.y,
+            particle.position.z,
+            particle.velocity.x,
+            particle.velocity.y,
+            particle.velocity.z,
+            particle.charge};
+    }
+
+    chart_samples[chart_next_sample] = sample;
+    chart_next_sample = (chart_next_sample + 1) % chart_sample_capacity;
+    chart_sample_count = (std::min)(chart_sample_count + 1,
+        chart_sample_capacity);
+    chart_last_recorded_step = metrics.steps;
+    InvalidateRect(chart_window, nullptr, FALSE);
+}
+
+constexpr std::size_t chart_quantity_count = 14;
+const wchar_t* chart_quantity_labels[chart_quantity_count]{
+    L"Скорость", L"Изменение скорости", L"Положение X",
+    L"Положение Y", L"Положение Z", L"Скорость Vx",
+    L"Скорость Vy", L"Скорость Vz", L"Заряд",
+    L"Кинетическая энергия", L"Потенциальная энергия",
+    L"Полная энергия", L"Температура", L"Давление"};
+
+void draw_chart_window(HDC context, const RECT& client_area)
+{
+    fill_rectangle(context, client_area, canvas_color);
+    const RECT toolbar{0, 0, client_area.right, 68};
+    fill_rectangle(context, toolbar, toolbar_color);
+    draw_line(context, 0, toolbar.bottom - 1,
+        client_area.right, toolbar.bottom - 1, border_color);
+    draw_text(context, L"Показатель",
+        RECT{16, 8, 86, 30}, muted_text_color, small_font);
+    const RECT quantity_button{16, 33, 226, 59};
+    const RECT mode_button{238, 33, 374, 59};
+    const RECT record_button{386, 33, 520, 59};
+    const RECT clear_button{532, 33, 626, 59};
+    const RECT selection_button{638, 33, 782, 59};
+    const auto draw_button = [context](const RECT& area,
+                                  const wchar_t* label, bool active) {
+        fill_rectangle(context, area,
+            active ? RGB(26, 55, 61) : RGB(20, 27, 39));
+        draw_line(context, area.left, area.top, area.right, area.top,
+            border_color);
+        draw_line(context, area.left, area.bottom - 1,
+            area.right, area.bottom - 1, border_color);
+        draw_line(context, area.left, area.top, area.left, area.bottom,
+            border_color);
+        draw_line(context, area.right - 1, area.top,
+            area.right - 1, area.bottom, border_color);
+        draw_text(context, label, area,
+            active ? x_axis_color : primary_text_color,
+            small_font, DT_CENTER);
+    };
+    draw_button(quantity_button, chart_quantity_labels[chart_quantity], false);
+    draw_button(mode_button,
+        chart_quantity >= 9 ? L"Система" :
+            chart_difference_mode ? L"Разность" : L"Отдельные",
+        chart_quantity >= 9);
+    draw_button(record_button,
+        chart_recording ? L"Запись: ВКЛ" : L"Запись: ВЫКЛ",
+        chart_recording);
+    draw_button(clear_button, L"Очистить", false);
+    draw_button(selection_button, L"Обновить выбор", false);
+
+    wchar_t status[96]{};
+    std::swprintf(status, std::size(status),
+        L"Записей: %llu / %llu    Молекул: %llu",
+        static_cast<unsigned long long>(chart_sample_count),
+        static_cast<unsigned long long>(chart_sample_capacity),
+        static_cast<unsigned long long>(chart_particle_indices.size()));
+    draw_text(context, status,
+        RECT{800, 28, client_area.right - 16, 58},
+        muted_text_color, small_font, DT_RIGHT);
+
+    RECT plot{82, 94, client_area.right - 28, client_area.bottom - 66};
+    if (plot.right - plot.left < 100 || plot.bottom - plot.top < 100)
+    {
+        return;
+    }
+    fill_rectangle(context, plot, RGB(12, 18, 28));
+    constexpr int horizontal_divisions = 5;
+    for (int index = 0; index <= horizontal_divisions; ++index)
+    {
+        const int y = plot.top + (plot.bottom - plot.top) * index /
+            horizontal_divisions;
+        draw_line(context, plot.left, y, plot.right, y,
+            RGB(31, 42, 57));
+    }
+    draw_line(context, plot.left, plot.top, plot.left, plot.bottom,
+        border_color);
+    draw_line(context, plot.left, plot.bottom, plot.right, plot.bottom,
+        border_color);
+    draw_text(context, chart_quantity_labels[chart_quantity],
+        RECT{16, plot.top, 78, plot.top + 30},
+        x_axis_color, small_font, DT_RIGHT);
+    if (chart_sample_count == 0)
+    {
+        draw_text(context, chart_recording
+                ? L"Запустите симуляцию, чтобы начать запись графика."
+                : L"Включите запись и запустите симуляцию.",
+            RECT{plot.left + 12, plot.top + 12,
+                plot.right - 12, plot.bottom - 12},
+            muted_text_color, status_font, DT_CENTER);
+        return;
+    }
+
+    const std::size_t oldest =
+        (chart_next_sample + chart_sample_capacity - chart_sample_count) %
+        chart_sample_capacity;
+    const double first_time = chart_samples[oldest].time;
+    const double last_time = chart_samples[
+        (chart_next_sample + chart_sample_capacity - 1) %
+        chart_sample_capacity].time;
+    const double time_range = (std::max)(last_time - first_time, 1e-9);
+
+    struct ChartLine
+    {
+        std::size_t first_slot = 0;
+        std::size_t second_slot = 0;
+        COLORREF color = x_axis_color;
+        wchar_t label[40]{};
+    };
+    ChartLine lines[maximum_chart_particles]{};
+    std::size_t line_count = 0;
+    const bool system_quantity = chart_quantity >= 9;
+    if (system_quantity)
+    {
+        lines[0].color = x_axis_color;
+        std::swprintf(lines[0].label, std::size(lines[0].label), L"Система");
+        line_count = 1;
+    }
+    else if (chart_difference_mode)
+    {
+        for (std::size_t slot = 1;
+            slot < chart_particle_indices.size() &&
+                line_count < maximum_chart_particles;
+            ++slot)
+        {
+            lines[line_count].first_slot = 0;
+            lines[line_count].second_slot = slot;
+            lines[line_count].color = static_cast<COLORREF>(
+                RGB(160 + (slot * 17) % 80, 132 + (slot * 29) % 100,
+                    190 + (slot * 11) % 60));
+            std::swprintf(lines[line_count].label,
+                std::size(lines[line_count].label), L"#%llu − #%llu",
+                static_cast<unsigned long long>(
+                    chart_particle_indices[0] + 1),
+                static_cast<unsigned long long>(
+                    chart_particle_indices[slot] + 1));
+            ++line_count;
+        }
+    }
+    else
+    {
+        for (std::size_t slot = 0;
+            slot < chart_particle_indices.size() &&
+                line_count < maximum_chart_particles;
+            ++slot)
+        {
+            lines[line_count].first_slot = slot;
+            lines[line_count].color = static_cast<COLORREF>(
+                RGB(69 + (slot * 37) % 150, 132 + (slot * 23) % 100,
+                    150 + (slot * 17) % 100));
+            std::swprintf(lines[line_count].label,
+                std::size(lines[line_count].label), L"Молекула #%llu",
+                static_cast<unsigned long long>(
+                    chart_particle_indices[slot] + 1));
+            ++line_count;
+        }
+    }
+
+    if (line_count == 0)
+    {
+        draw_text(context,
+            L"Для графика разности выберите минимум две молекулы.",
+            RECT{plot.left + 12, plot.top + 12,
+                plot.right - 12, plot.bottom - 12},
+            muted_text_color, status_font, DT_CENTER);
+        return;
+    }
+
+    double minimum = 0.0;
+    double maximum = 0.0;
+    bool has_value = false;
+    for (std::size_t sample_index = 0;
+        sample_index < chart_sample_count;
+        ++sample_index)
+    {
+        for (std::size_t line_index = 0; line_index < line_count;
+            ++line_index)
+        {
+            double value = chart_sample_value(sample_index,
+                lines[line_index].first_slot, chart_quantity);
+            if (chart_difference_mode && !system_quantity)
+            {
+                value -= chart_sample_value(sample_index,
+                    lines[line_index].second_slot, chart_quantity);
+            }
+            if (!has_value)
+            {
+                minimum = maximum = value;
+                has_value = true;
+            }
+            else
+            {
+                minimum = (std::min)(minimum, value);
+                maximum = (std::max)(maximum, value);
+            }
+        }
+    }
+    const double value_range = (std::max)(maximum - minimum, 1e-9);
+    const double vertical_margin = value_range * 0.08;
+    minimum -= vertical_margin;
+    maximum += vertical_margin;
+    const double adjusted_range = maximum - minimum;
+    wchar_t axis_value[32]{};
+    for (int index = 0; index <= horizontal_divisions; ++index)
+    {
+        const double value = maximum -
+            adjusted_range * static_cast<double>(index) /
+                horizontal_divisions;
+        std::swprintf(axis_value, std::size(axis_value), L"%.3g", value);
+        const int y = plot.top + (plot.bottom - plot.top) * index /
+            horizontal_divisions;
+        draw_text(context, axis_value,
+            RECT{4, y - 8, plot.left - 8, y + 8},
+            muted_text_color, small_font, DT_RIGHT);
+    }
+    for (std::size_t line_index = 0; line_index < line_count; ++line_index)
+    {
+        HPEN pen = CreatePen(PS_SOLID, 2, lines[line_index].color);
+        HPEN previous_pen = static_cast<HPEN>(SelectObject(context, pen));
+        bool previous_valid = false;
+        for (std::size_t sample_index = 0;
+            sample_index < chart_sample_count;
+            ++sample_index)
+        {
+            const std::size_t ring_index =
+                (oldest + sample_index) % chart_sample_capacity;
+            const ChartSample& sample = chart_samples[ring_index];
+            double value = chart_sample_value(sample_index,
+                lines[line_index].first_slot, chart_quantity);
+            if (chart_difference_mode && !system_quantity)
+            {
+                value -= chart_sample_value(sample_index,
+                    lines[line_index].second_slot, chart_quantity);
+            }
+            if (!std::isfinite(value))
+            {
+                previous_valid = false;
+                continue;
+            }
+            const int x = plot.left + static_cast<int>(
+                (sample.time - first_time) / time_range *
+                (plot.right - plot.left));
+            const int y = plot.bottom - static_cast<int>(
+                (value - minimum) / adjusted_range *
+                (plot.bottom - plot.top));
+            if (previous_valid)
+            {
+                LineTo(context, x, y);
+            }
+            else
+            {
+                MoveToEx(context, x, y, nullptr);
+            }
+            previous_valid = true;
+        }
+        SelectObject(context, previous_pen);
+        DeleteObject(pen);
+    }
+
+    int legend_left = plot.left + 12;
+    for (std::size_t index = 0; index < line_count; ++index)
+    {
+        draw_line(context, legend_left, client_area.bottom - 38,
+            legend_left + 22, client_area.bottom - 38,
+            lines[index].color, 2);
+        draw_text(context, lines[index].label,
+            RECT{legend_left + 28, client_area.bottom - 49,
+                legend_left + 150, client_area.bottom - 27},
+            primary_text_color, small_font);
+        legend_left += 165;
+        if (legend_left + 160 > client_area.right)
+        {
+            break;
+        }
+    }
+    wchar_t time_label[64]{};
+    std::swprintf(time_label, std::size(time_label),
+        L"Время симуляции: %.4f – %.4f", first_time, last_time);
+    draw_text(context, time_label,
+        RECT{plot.left, client_area.bottom - 26,
+            plot.right, client_area.bottom - 6},
+        muted_text_color, small_font, DT_RIGHT);
+}
+
+LRESULT CALLBACK chart_window_procedure(
+    HWND window, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    if (message == WM_ERASEBKGND)
+    {
+        return 1;
+    }
+    if (message == WM_PAINT)
+    {
+        PAINTSTRUCT paint{};
+        HDC context = BeginPaint(window, &paint);
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        draw_chart_window(context, client_area);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    if (message == WM_LBUTTONDOWN)
+    {
+        const int x = static_cast<short>(LOWORD(l_param));
+        const int y = static_cast<short>(HIWORD(l_param));
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        if (y >= 33 && y <= 59)
+        {
+            if (x >= 16 && x < 226)
+            {
+                chart_quantity =
+                    (chart_quantity + 1) % chart_quantity_count;
+            }
+            else if (x >= 238 && x < 374)
+            {
+                if (chart_quantity < 9)
+                {
+                    chart_difference_mode = !chart_difference_mode;
+                }
+            }
+            else if (x >= 386 && x < 520)
+            {
+                chart_recording = !chart_recording;
+            }
+            else if (x >= 532 && x < 626)
+            {
+                chart_sample_count = 0;
+                chart_next_sample = 0;
+                chart_last_recorded_step = 0;
+            }
+            else if (x >= 638 && x < 782)
+            {
+                capture_chart_particle_selection();
+                chart_sample_count = 0;
+                chart_next_sample = 0;
+                chart_last_recorded_step = 0;
+            }
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+    if (message == WM_GETMINMAXINFO)
+    {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
+        limits->ptMinTrackSize.x = 850;
+        limits->ptMinTrackSize.y = 420;
+        return 0;
+    }
+    if (message == WM_CLOSE)
+    {
+        chart_recording = false;
+        DestroyWindow(window);
+        return 0;
+    }
+    if (message == WM_DESTROY && chart_window == window)
+    {
+        chart_window = nullptr;
+        chart_recording = false;
+        return 0;
+    }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
+
+void show_chart_window(HWND owner)
+{
+    if (chart_window != nullptr)
+    {
+        ShowWindow(chart_window, SW_SHOW);
+        SetForegroundWindow(chart_window);
+        return;
+    }
+
+    static bool class_registered = false;
+    if (!class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = chart_window_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor =
+            LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground = nullptr;
+        window_class.lpszClassName = chart_window_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(owner, L"Не удалось зарегистрировать окно графиков.",
+                L"Графики", MB_OK | MB_ICONERROR);
+            return;
+        }
+        class_registered = true;
+    }
+
+    if (!chart_selection_initialized)
+    {
+        capture_chart_particle_selection();
+    }
+
+    if (chart_samples.size() != chart_sample_capacity)
+    {
+        chart_samples.resize(chart_sample_capacity);
+        chart_sample_count = 0;
+        chart_next_sample = 0;
+        chart_last_recorded_step = 0;
+    }
+    chart_recording = true;
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    chart_window = CreateWindowExW(0, chart_window_class_name,
+        L"Bonderium — графики симуляции",
+        WS_OVERLAPPEDWINDOW,
+        owner_rect.left + 80, owner_rect.top + 60, 1000, 650,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (chart_window == nullptr)
+    {
+        chart_recording = false;
+        MessageBoxW(owner, L"Не удалось создать окно графиков.",
+            L"Графики", MB_OK | MB_ICONERROR);
+        return;
+    }
+    ShowWindow(chart_window, SW_SHOW);
+    UpdateWindow(chart_window);
+}
+
+void toggle_selected_particles_fixed(HWND window)
+{
+    const std::vector<std::size_t> selection = current_selection();
+    if (selection.empty())
+    {
+        MessageBoxW(window, L"Сначала выберите одну или несколько молекул.",
+            L"Заморозка молекул", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    bool should_freeze = false;
+    for (const std::size_t index : selection)
+    {
+        if (index < simulation_engine.particles().size() &&
+            !simulation_engine.particles()[index].fixed)
+        {
+            should_freeze = true;
+            break;
+        }
+    }
+    for (const std::size_t index : selection)
+    {
+        if (!simulation_engine.set_particle_fixed(index, should_freeze))
+        {
+            MessageBoxW(window, L"Не удалось изменить состояние молекулы.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void select_or_toggle_particle(HWND window, std::uint64_t molecule_id)
+{
+    if (molecule_id == 0)
+    {
+        selected_molecule_id = 0;
+        selected_particles.clear();
+        invalidate_simulation_ui(window, false);
+        return;
+    }
+    const std::size_t index = static_cast<std::size_t>(molecule_id - 1);
+    selected_molecule_id = molecule_id;
+    if (molecular_tool == MolecularTool::multi_select)
+    {
+        const auto selected = std::find(
+            selected_particles.begin(), selected_particles.end(), index);
+        if (selected == selected_particles.end())
+        {
+            selected_particles.push_back(index);
+        }
+        else
+        {
+            selected_particles.erase(selected);
+            selected_molecule_id = selected_particles.empty()
+                ? 0 : static_cast<std::uint64_t>(selected_particles.back() + 1);
+        }
+    }
+    else
+    {
+        selected_particles.clear();
+    }
+    invalidate_simulation_ui(window, false);
+}
+
+bool parse_input_number(const wchar_t* text, double& value)
+{
+    wchar_t* end = nullptr;
+    value = std::wcstod(text, &end);
+    return end != text && *end == L'\0' && std::isfinite(value);
+}
+
+void configure_square_lattice(HWND window)
+{
+    InputDialogState dialog;
+    dialog.title = L"Квадратная решётка";
+    dialog.field_count = 1;
+    dialog.labels[0] = L"Количество молекул (1–10000):";
+    std::swprintf(dialog.values[0],
+        sizeof(dialog.values[0]) / sizeof(dialog.values[0][0]), L"%llu",
+        static_cast<unsigned long long>(square_lattice_count));
+    if (!show_input_dialog(window, dialog))
+    {
+        return;
+    }
+    wchar_t* end = nullptr;
+    const unsigned long long count =
+        std::wcstoull(dialog.values[0], &end, 10);
+    if (end == dialog.values[0] || *end != L'\0' ||
+        count == 0 || count > 10000)
+    {
+        MessageBoxW(window, L"Укажите целое число от 1 до 10000.",
+            L"Некорректное количество", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    square_lattice_count = static_cast<std::size_t>(count);
+    square_lattice_for_scenario = false;
+    molecular_tool = MolecularTool::square_lattice;
+    molecule_tool_active = false;
+    bond_tool_active = false;
+    invalidate_simulation_ui(window, true);
+}
+
+void add_scenario_step(HWND window)
+{
+    const std::vector<std::size_t> targets = current_selection();
+    if (targets.empty())
+    {
+        MessageBoxW(window,
+            L"Выберите молекулы, на которые будет действовать сила.",
+            L"Конструктор сценария", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    InputDialogState dialog;
+    dialog.title = L"Шаг сценария: сила";
+    dialog.field_count = 4;
+    dialog.labels[0] = L"Длительность шага, секунд (0.01–3600):";
+    dialog.labels[1] = L"Сила по X (-200…200):";
+    dialog.labels[2] = L"Сила по Y (-200…200):";
+    dialog.labels[3] = L"Сила по Z (-200…200):";
+    std::swprintf(dialog.values[0],
+        sizeof(dialog.values[0]) / sizeof(dialog.values[0][0]), L"1.0");
+    for (std::size_t index = 1; index < dialog.field_count; ++index)
+    {
+        std::swprintf(dialog.values[index],
+            sizeof(dialog.values[index]) / sizeof(dialog.values[index][0]),
+            L"0");
+    }
+    if (!show_input_dialog(window, dialog))
+    {
+        return;
+    }
+    double duration = 0.0;
+    Vec3 force{};
+    if (!parse_input_number(dialog.values[0], duration) ||
+        duration < 0.01 || duration > 3600.0 ||
+        !parse_input_number(dialog.values[1], force.x) ||
+        !parse_input_number(dialog.values[2], force.y) ||
+        !parse_input_number(dialog.values[3], force.z) ||
+        std::abs(force.x) > maximum_interaction_force ||
+        std::abs(force.y) > maximum_interaction_force ||
+        std::abs(force.z) > maximum_interaction_force)
+    {
+        MessageBoxW(window,
+            L"Проверьте длительность и компоненты силы. "
+            L"Длительность: 0.01–3600 секунд, каждая компонента: ±200.",
+            L"Некорректный шаг сценария", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    ScenarioStep step;
+    step.action = ScenarioAction::apply_force;
+    step.duration_seconds = duration;
+    step.force = force;
+    step.targets = targets;
+    scenario_steps.push_back(std::move(step));
+    invalidate_simulation_ui(window, false);
+}
+
+bool create_square_lattice(HWND window, std::size_t count,
+    Vec3 start, Vec3 end)
+{
+    if (!ram_budget_allows_molecule(window, count))
+    {
+        return false;
+    }
+    const double dx = end.x - start.x;
+    const double dy = end.y - start.y;
+    const double side = (std::max)(std::abs(dx), std::abs(dy));
+    if (side < 0.1)
+    {
+        return false;
+    }
+    const std::size_t columns = static_cast<std::size_t>(
+        std::ceil(std::sqrt(static_cast<double>(count))));
+    const std::size_t rows = (count + columns - 1) / columns;
+    const double spacing = side /
+        static_cast<double>((std::max)(columns, rows));
+    const double end_x = start.x + (dx < 0.0 ? -side : side);
+    const double end_y = start.y + (dy < 0.0 ? -side : side);
+    const double center_x = (start.x + end_x) * 0.5;
+    const double center_y = (start.y + end_y) * 0.5;
+    const double start_x = center_x -
+        spacing * static_cast<double>(columns - 1) * 0.5;
+    const double start_y = center_y -
+        spacing * static_cast<double>(rows - 1) * 0.5;
+    const std::size_t initial_particle_count =
+        simulation_engine.particles().size();
+    for (std::size_t index = 0; index < count; ++index)
+    {
+        const std::size_t column = index % columns;
+        const std::size_t row = index / columns;
+        const Vec3 position{
+            start_x + static_cast<double>(column) * spacing,
+            start_y + static_cast<double>(row) * spacing,
+            start.z};
+        const std::size_t particle_index =
+            simulation_engine.add_particle(position);
+        if (!simulation_engine.set_particle_properties(particle_index, 1.0,
+                0.0, molecule_sigma, molecule_epsilon, false))
+        {
+            const std::size_t added =
+                simulation_engine.particles().size() -
+                initial_particle_count;
+            wchar_t message[160]{};
+            std::swprintf(message, sizeof(message) / sizeof(message[0]),
+                L"Не удалось настроить молекулу. Добавлено частиц: %llu из %llu.",
+                static_cast<unsigned long long>(added),
+                static_cast<unsigned long long>(count));
+            MessageBoxW(window, message, L"Ошибка симуляции",
+                MB_OK | MB_ICONERROR);
+            return false;
+        }
+    }
+    selected_particles.clear();
+    selected_molecule_id = static_cast<std::uint64_t>(
+        simulation_engine.particles().size());
+    return true;
+}
+
+void configure_scenario_lattice(HWND window)
+{
+    InputDialogState dialog;
+    dialog.title = L"Шаг сценария: решётка";
+    dialog.field_count = 2;
+    dialog.labels[0] = L"Количество молекул (1–10000):";
+    dialog.labels[1] = L"Задержка шага, секунд (0.01–3600):";
+    std::swprintf(dialog.values[0],
+        sizeof(dialog.values[0]) / sizeof(dialog.values[0][0]), L"%llu",
+        static_cast<unsigned long long>(square_lattice_count));
+    std::swprintf(dialog.values[1],
+        sizeof(dialog.values[1]) / sizeof(dialog.values[1][0]), L"1.0");
+    if (!show_input_dialog(window, dialog))
+    {
+        return;
+    }
+    wchar_t* end = nullptr;
+    const unsigned long long count =
+        std::wcstoull(dialog.values[0], &end, 10);
+    double duration = 0.0;
+    if (end == dialog.values[0] || *end != L'\0' ||
+        count == 0 || count > 10000 ||
+        !parse_input_number(dialog.values[1], duration) ||
+        duration < 0.01 || duration > 3600.0)
+    {
+        MessageBoxW(window,
+            L"Количество должно быть 1–10000, задержка — 0.01–3600 секунд.",
+            L"Некорректный шаблон", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    square_lattice_count = static_cast<std::size_t>(count);
+    pending_lattice_duration = duration;
+    square_lattice_for_scenario = true;
+    molecular_tool = MolecularTool::square_lattice;
+    molecule_tool_active = false;
+    bond_tool_active = false;
+    invalidate_simulation_ui(window, true);
+}
+
+void show_scenario_step_menu(HWND window)
+{
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
+    {
+        MessageBoxW(window, L"Не удалось открыть меню сценария.",
+            L"Конструктор сценария", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const bool menu_ready =
+        AppendMenuW(menu, MF_STRING, menu_scenario_force_step,
+            L"Шаг с внешней силой") &&
+        AppendMenuW(menu, MF_STRING, menu_scenario_lattice_step,
+            L"Шаг создания решётки");
+    if (!menu_ready)
+    {
+        DestroyMenu(menu);
+        MessageBoxW(window, L"Не удалось создать меню сценария.",
+            L"Конструктор сценария", MB_OK | MB_ICONERROR);
+        return;
+    }
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT button = tools_panel_button_area(client_area, 3);
+    POINT menu_position{button.left, button.bottom};
+    ClientToScreen(window, &menu_position);
+    SetForegroundWindow(window);
+    const UINT command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        menu_position.x, menu_position.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    if (command == menu_scenario_force_step)
+    {
+        add_scenario_step(window);
+    }
+    else if (command == menu_scenario_lattice_step)
+    {
+        configure_scenario_lattice(window);
+    }
+}
+
+void update_scenario(HWND window, double elapsed)
+{
+    if (!scenario_running)
+    {
+        return;
+    }
+    scenario_elapsed_seconds += elapsed;
+    double step_end = 0.0;
+    std::size_t next_step = scenario_steps.size();
+    for (std::size_t index = 0; index < scenario_steps.size(); ++index)
+    {
+        step_end += scenario_steps[index].duration_seconds;
+        if (scenario_elapsed_seconds < step_end)
+        {
+            next_step = index;
+            break;
+        }
+    }
+    if (next_step == active_scenario_step)
+    {
+        return;
+    }
+    if (active_scenario_step < scenario_steps.size() &&
+        scenario_steps[active_scenario_step].action ==
+            ScenarioAction::apply_force)
+    {
+        for (const std::size_t target :
+            scenario_steps[active_scenario_step].targets)
+        {
+            if (target < simulation_engine.particles().size() &&
+                !simulation_engine.set_external_force(target, Vec3{}))
+            {
+                MessageBoxW(window,
+                    L"Не удалось переключить силу сценария.",
+                    L"Ошибка сценария", MB_OK | MB_ICONERROR);
+                stop_scenario(window);
+                return;
+            }
+        }
+    }
+    for (std::size_t index = active_scenario_step + 1;
+        index < next_step; ++index)
+    {
+        const ScenarioStep& skipped_step = scenario_steps[index];
+        if (skipped_step.action == ScenarioAction::spawn_lattice &&
+            !create_square_lattice(window, skipped_step.lattice_count,
+                skipped_step.lattice_start, skipped_step.lattice_end))
+        {
+            stop_scenario(window);
+            return;
+        }
+    }
+    active_scenario_step = next_step;
+    if (active_scenario_step >= scenario_steps.size())
+    {
+        scenario_running = false;
+        scenario_elapsed_seconds = 0.0;
+        active_scenario_step = static_cast<std::size_t>(-1);
+        invalidate_simulation_ui(window, false);
+        return;
+    }
+    const ScenarioStep& step = scenario_steps[active_scenario_step];
+    if (step.action == ScenarioAction::spawn_lattice)
+    {
+        if (!create_square_lattice(window, step.lattice_count,
+                step.lattice_start, step.lattice_end))
+        {
+            stop_scenario(window);
+            return;
+        }
+    }
+    else
+    {
+        for (const std::size_t target : step.targets)
+        {
+            if (target < simulation_engine.particles().size() &&
+                !simulation_engine.set_external_force(target, step.force))
+            {
+                MessageBoxW(window,
+                    L"Не удалось применить силу шага сценария.",
+                    L"Ошибка сценария", MB_OK | MB_ICONERROR);
+                stop_scenario(window);
+                return;
+            }
+        }
+    }
+    invalidate_simulation_ui(window, false);
+}
+
+void stop_scenario(HWND window)
+{
+    bool release_failed = false;
+    if (active_scenario_step < scenario_steps.size() &&
+        scenario_steps[active_scenario_step].action ==
+            ScenarioAction::apply_force)
+    {
+        for (const std::size_t target :
+            scenario_steps[active_scenario_step].targets)
+        {
+            if (target < simulation_engine.particles().size() &&
+                !simulation_engine.set_external_force(target, Vec3{}))
+            {
+                release_failed = true;
+            }
+        }
+    }
+    scenario_running = false;
+    scenario_elapsed_seconds = 0.0;
+    active_scenario_step = static_cast<std::size_t>(-1);
+    if (release_failed)
+    {
+        MessageBoxW(window,
+            L"Не удалось снять одну или несколько сил сценария.",
+            L"Ошибка сценария", MB_OK | MB_ICONERROR);
+    }
+    invalidate_simulation_ui(window, false);
+}
+
+void toggle_scenario(HWND window)
+{
+    if (scenario_running)
+    {
+        stop_scenario(window);
+    }
+    else if (scenario_steps.empty())
+    {
+        MessageBoxW(window, L"Добавьте хотя бы один шаг сценария.",
+            L"Конструктор сценария", MB_OK | MB_ICONINFORMATION);
+    }
+    else if (!simulation_running)
+    {
+        MessageBoxW(window, L"Сначала запустите симуляцию.",
+            L"Конструктор сценария", MB_OK | MB_ICONINFORMATION);
+    }
+    else if (molecule_dragging)
+    {
+        MessageBoxW(window,
+            L"Завершите взаимодействие с молекулой перед запуском сценария.",
+            L"Конструктор сценария", MB_OK | MB_ICONINFORMATION);
+    }
+    else
+    {
+        scenario_running = true;
+        scenario_elapsed_seconds = 0.0;
+        active_scenario_step = static_cast<std::size_t>(-1);
+    }
+    invalidate_simulation_ui(window, false);
+}
+
+void clear_scenario(HWND window)
+{
+    stop_scenario(window);
+    scenario_steps.clear();
+    invalidate_simulation_ui(window, false);
+}
+
+bool place_square_lattice(HWND window)
+{
+    return create_square_lattice(window, square_lattice_count,
+        square_lattice_start, square_lattice_end);
+}
+
 void update_simulation(HWND window)
 {
     const ULONGLONG now = GetTickCount64();
@@ -2170,9 +4422,12 @@ void update_simulation(HWND window)
         static_cast<double>(now - last_simulation_tick) / 1000.0);
     last_simulation_tick = now;
     const double time_step = simulation_engine.config().time_step;
+    const unsigned int maximum_steps_this_tick =
+        static_cast<unsigned int>(std::ceil(
+            maximum_catch_up_steps * time_flow_factor));
     simulation_time_accumulator = (std::min)(
-        simulation_time_accumulator + elapsed,
-        time_step * maximum_catch_up_steps);
+        simulation_time_accumulator + elapsed * time_flow_factor,
+        time_step * maximum_steps_this_tick);
 
     unsigned int completed_steps = 0;
     std::string error;
@@ -2182,8 +4437,9 @@ void update_simulation(HWND window)
         return;
     }
     while (simulation_time_accumulator >= time_step &&
-        completed_steps < maximum_catch_up_steps)
+        completed_steps < maximum_steps_this_tick)
     {
+        update_scenario(window, time_step);
         if (!simulation_engine.step(error))
         {
             set_simulation_running(window, false);
@@ -2195,6 +4451,7 @@ void update_simulation(HWND window)
         }
         simulation_time_accumulator -= time_step;
         ++completed_steps;
+        record_chart_sample();
     }
 
     RECT client_area{};
@@ -2291,8 +4548,10 @@ void update_camera_motion(HWND window)
         static_cast<int>(is_key_down('S') || is_key_down(VK_DOWN));
     const int sideways = static_cast<int>(is_key_down('D') || is_key_down(VK_RIGHT)) -
         static_cast<int>(is_key_down('A') || is_key_down(VK_LEFT));
-    const int vertical = static_cast<int>(is_key_down('E')) -
-        static_cast<int>(is_key_down('Q'));
+    const int vertical = simulation_engine.config().two_dimensional
+        ? 0
+        : static_cast<int>(is_key_down('E')) -
+            static_cast<int>(is_key_down('Q'));
     const double diagonal_scale = forward != 0 && sideways != 0
         ? 0.7071067811865476
         : 1.0;
@@ -2309,6 +4568,10 @@ void update_camera_motion(HWND window)
     camera_state.velocity = camera_state.velocity +
         (desired_velocity - camera_state.velocity) * easing;
     camera_state.target = camera_state.target + camera_state.velocity * elapsed;
+    if (simulation_engine.config().two_dimensional)
+    {
+        camera_state.target.z = 0.0;
+    }
 
     RECT client_area{};
     GetClientRect(window, &client_area);
@@ -2331,6 +4594,41 @@ void reset_view(HWND window)
     stop_camera_motion(window);
 }
 
+void toggle_dimension_mode(HWND window)
+{
+    const bool enabling_2d =
+        !simulation_engine.config().two_dimensional;
+    if (enabling_2d)
+    {
+        saved_3d_yaw = camera_state.yaw;
+        saved_3d_pitch = camera_state.pitch;
+        saved_3d_camera = true;
+    }
+    if (!simulation_engine.set_dimension_mode(enabling_2d))
+    {
+        MessageBoxW(window, L"Не удалось изменить размерность симуляции.",
+            L"Размерность", MB_OK | MB_ICONERROR);
+        return;
+    }
+    stop_camera_motion(window);
+    wall_tool_active = false;
+    wall_dragging = false;
+    if (enabling_2d)
+    {
+        camera_state.target.z = 0.0;
+        camera_state.yaw = -pi / 2.0;
+        camera_state.pitch = 1.52;
+        molecule_placement_height = 0.0;
+    }
+    else
+    {
+        camera_state.yaw = saved_3d_camera ? saved_3d_yaw : -pi / 4.0;
+        camera_state.pitch = saved_3d_camera ? saved_3d_pitch : pi / 3.0;
+        molecule_placement_height = molecule_radius;
+    }
+    invalidate_simulation_ui(window, true);
+}
+
 void place_molecule(HWND window, POINT position)
 {
     if (!ram_budget_allows_molecule(window))
@@ -2340,8 +4638,9 @@ void place_molecule(HWND window, POINT position)
     RECT client_area{};
     GetClientRect(window, &client_area);
     Vec3 world_position{};
-    if (!screen_to_plane(client_area, position,
-            molecule_placement_height, world_position))
+    const double placement_z = simulation_engine.config().two_dimensional
+        ? 0.0 : molecule_placement_height;
+    if (!screen_to_plane(client_area, position, placement_z, world_position))
     {
         return;
     }
@@ -2356,6 +4655,7 @@ void place_molecule(HWND window, POINT position)
     }
     selected_molecule_id =
         static_cast<std::uint64_t>(particle_index + 1);
+    selected_particles.clear();
 }
 
 bool begin_molecule_interaction(
@@ -2367,10 +4667,12 @@ bool begin_molecule_interaction(
     if (molecule_id == 0)
     {
         selected_molecule_id = 0;
+        selected_particles.clear();
         return false;
     }
 
     selected_molecule_id = molecule_id;
+    selected_particles.clear();
     if (interaction_tool == InteractionTool::select ||
         !simulation_running)
     {
@@ -2507,6 +4809,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     {
         if (w_param != SIZE_MINIMIZED)
         {
+            resize_detached_interface_window(window);
             InvalidateRect(window, nullptr, FALSE);
         }
         return 0;
@@ -2616,21 +4919,23 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 ReleaseDC(window, overlay_context);
             }
         }
-        else
+        else if (!separate_interface_windows)
         {
-            const RECT toolbar{
-                client_area.left, client_area.top,
-                client_area.right, client_area.top + toolbar_height};
-            const RECT footer{
-                client_area.left, client_area.bottom - footer_height,
-                client_area.right, client_area.bottom};
-            if (rectangles_intersect(paint.rcPaint, toolbar))
+            if (toolbar_visible &&
+                rectangles_intersect(paint.rcPaint, toolbar_area(client_area)))
             {
                 draw_toolbar_overlay(paint_context, client_area);
             }
-            if (rectangles_intersect(paint.rcPaint, footer))
+            if (footer_visible &&
+                rectangles_intersect(paint.rcPaint, footer_area(client_area)))
             {
                 draw_footer_overlay(paint_context, client_area);
+            }
+            if (tools_panel_visible &&
+                rectangles_intersect(
+                    paint.rcPaint, tools_panel_area(client_area)))
+            {
+                draw_tools_panel_overlay(paint_context, client_area);
             }
         }
         EndPaint(window, &paint);
@@ -2645,12 +4950,56 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     {
         if (w_param == VK_F11 && (l_param & (1L << 30)) == 0)
         {
-            toggle_fullscreen(window);
+            if (!separate_interface_windows)
+            {
+                toggle_fullscreen(window);
+            }
             return 0;
         }
-        if (w_param == VK_ESCAPE && (molecule_tool_active || bond_tool_active))
+        if (w_param == VK_F2 && (l_param & (1L << 30)) == 0)
         {
+            show_panels_menu(window);
+            return 0;
+        }
+        if (w_param == VK_F1 && (l_param & (1L << 30)) == 0)
+        {
+            show_help(window);
+            return 0;
+        }
+        if (w_param == VK_ESCAPE && (molecule_tool_active || bond_tool_active ||
+                molecular_tool != MolecularTool::select ||
+                square_lattice_dragging || wall_tool_active ||
+                wall_dragging))
+        {
+            if (square_lattice_dragging)
+            {
+                square_lattice_dragging = false;
+                square_lattice_for_scenario = false;
+                ReleaseCapture();
+            }
+            if (wall_dragging)
+            {
+                wall_dragging = false;
+                ReleaseCapture();
+            }
+            wall_tool_active = false;
             set_molecule_tool(window, false);
+            return 0;
+        }
+        if (w_param == '2' && (l_param & (1L << 30)) == 0)
+        {
+            if (!simulation_engine.config().two_dimensional)
+            {
+                toggle_dimension_mode(window);
+            }
+            return 0;
+        }
+        if (w_param == '3' && (l_param & (1L << 30)) == 0)
+        {
+            if (simulation_engine.config().two_dimensional)
+            {
+                toggle_dimension_mode(window);
+            }
             return 0;
         }
         if (w_param == 'C' && (l_param & (1L << 30)) == 0)
@@ -2790,6 +5139,11 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         const POINT position{
             static_cast<short>(LOWORD(l_param)),
             static_cast<short>(HIWORD(l_param))};
+        if (time_slider_dragging)
+        {
+            set_time_flow_from_pointer(window, position);
+            return 0;
+        }
         RECT client_area{};
         GetClientRect(window, &client_area);
         const RECT area = scene_area(client_area);
@@ -2811,16 +5165,52 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         else if (pan_dragging)
         {
             const double scale = camera_state.distance * 0.003;
-            camera_state.target.x -= (position.x - drag_last_position.x) *
-                std::cos(camera_state.yaw) * scale;
-            camera_state.target.y -= (position.x - drag_last_position.x) *
-                std::sin(camera_state.yaw) * scale;
-            camera_state.target.z += (position.y - drag_last_position.y) * scale;
+            if (simulation_engine.config().two_dimensional)
+            {
+                camera_state.target.x -=
+                    (position.x - drag_last_position.x) * scale;
+                camera_state.target.y +=
+                    (position.y - drag_last_position.y) * scale;
+            }
+            else
+            {
+                camera_state.target.x -=
+                    (position.x - drag_last_position.x) *
+                    std::cos(camera_state.yaw) * scale;
+                camera_state.target.y -=
+                    (position.x - drag_last_position.x) *
+                    std::sin(camera_state.yaw) * scale;
+                camera_state.target.z +=
+                    (position.y - drag_last_position.y) * scale;
+            }
             drag_last_position = position;
             InvalidateRect(window, &area, FALSE);
         }
         else if (molecule_dragging)
         {
+            InvalidateRect(window, &area, FALSE);
+        }
+        else if (square_lattice_dragging)
+        {
+            Vec3 world_position{};
+            if (screen_to_plane(client_area, position,
+                    square_lattice_start.z, world_position))
+            {
+                square_lattice_end = world_position;
+            }
+            InvalidateRect(window, &area, FALSE);
+        }
+        else if (wall_dragging)
+        {
+            Vec3 world_position{};
+            if (screen_to_plane(client_area, position, wall_start.z,
+                    world_position))
+            {
+                wall_end = Vec3{
+                    std::round(world_position.x),
+                    std::round(world_position.y),
+                    wall_start.z};
+            }
             InvalidateRect(window, &area, FALSE);
         }
 
@@ -2855,7 +5245,8 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         return 0;
     }
 
-    if (message == WM_RBUTTONDOWN && pointer_over_scene)
+    if (message == WM_RBUTTONDOWN && pointer_over_scene &&
+        !simulation_engine.config().two_dimensional)
     {
         orbit_dragging = true;
         drag_last_position = POINT{
@@ -2869,6 +5260,83 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     {
         stop_molecule_interaction(window);
         ReleaseCapture();
+        return 0;
+    }
+
+    if (message == WM_LBUTTONUP && time_slider_dragging)
+    {
+        time_slider_dragging = false;
+        ReleaseCapture();
+        return 0;
+    }
+
+    if (message == WM_LBUTTONUP && square_lattice_dragging)
+    {
+        const bool scenario_lattice = square_lattice_for_scenario;
+        square_lattice_dragging = false;
+        ReleaseCapture();
+        bool placed = false;
+        if (scenario_lattice)
+        {
+            const double side = (std::max)(
+                std::abs(square_lattice_end.x - square_lattice_start.x),
+                std::abs(square_lattice_end.y - square_lattice_start.y));
+            if (side >= 0.1)
+            {
+                ScenarioStep step;
+                step.action = ScenarioAction::spawn_lattice;
+                step.duration_seconds = pending_lattice_duration;
+                step.lattice_count = square_lattice_count;
+                step.lattice_start = square_lattice_start;
+                step.lattice_end = square_lattice_end;
+                scenario_steps.push_back(std::move(step));
+                placed = true;
+            }
+            else
+            {
+                MessageBoxW(window,
+                    L"Нарисуйте квадрат размером не менее 0.1 единицы.",
+                    L"Шаг сценария", MB_OK | MB_ICONINFORMATION);
+            }
+            square_lattice_for_scenario = false;
+        }
+        else
+        {
+            placed = place_square_lattice(window);
+        }
+        molecular_tool = MolecularTool::select;
+        if (placed)
+        {
+            invalidate_simulation_ui(window, true);
+        }
+        else
+        {
+            RECT client_area{};
+            GetClientRect(window, &client_area);
+            const RECT area = scene_area(client_area);
+            InvalidateRect(window, &area, FALSE);
+        }
+        return 0;
+    }
+
+    if (message == WM_LBUTTONUP && wall_dragging)
+    {
+        wall_dragging = false;
+        ReleaseCapture();
+        simulation::Wall wall{
+            wall_start, wall_end,
+            !simulation_engine.config().two_dimensional};
+        std::string error;
+        if (!simulation_engine.add_wall(wall, error))
+        {
+            const std::wstring message_text(error.begin(), error.end());
+            MessageBoxW(window, message_text.c_str(),
+                L"Не удалось создать стену", MB_OK | MB_ICONWARNING);
+        }
+        else
+        {
+            invalidate_simulation_ui(window, true);
+        }
         return 0;
     }
 
@@ -2900,6 +5368,20 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     {
         orbit_dragging = false;
         pan_dragging = false;
+        time_slider_dragging = false;
+        const bool cancelled_lattice = square_lattice_dragging;
+        const bool cancelled_wall = wall_dragging;
+        square_lattice_dragging = false;
+        wall_dragging = false;
+        if (cancelled_lattice)
+        {
+            square_lattice_for_scenario = false;
+            molecular_tool = MolecularTool::select;
+        }
+        if (cancelled_wall)
+        {
+            wall_tool_active = false;
+        }
         if (molecule_dragging)
         {
             stop_molecule_interaction(window);
@@ -2913,44 +5395,159 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             static_cast<short>(HIWORD(l_param))};
         RECT client_area{};
         GetClientRect(window, &client_area);
+        const RECT time_slider = time_flow_slider_area(client_area);
+        if (toolbar_visible && PtInRect(&time_slider, position))
+        {
+            time_slider_dragging = true;
+            SetCapture(window);
+            set_time_flow_from_pointer(window, position);
+            return 0;
+        }
         const RECT button_area = molecule_tool_area(client_area);
+        const RECT help_button = help_tool_area(client_area);
         const RECT simulation_button = simulation_tool_area(client_area);
         const RECT graphics_button = graphics_tool_area(client_area);
         const RECT interaction_button =
             interaction_tool_area(client_area);
         const RECT auto_button = auto_config_tool_area(client_area);
         const RECT restart_button = restart_tool_area(client_area);
-        if (PtInRect(&auto_button, position))
+        const RECT tools_panel = tools_panel_area(client_area);
+        const RECT tools_close{
+            tools_panel.right - 34, tools_panel.top,
+            tools_panel.right - 4, tools_panel.top + 38};
+        if (tools_panel_visible &&
+            PtInRect(&tools_close, position))
+        {
+            tools_panel_visible = false;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        if (tools_panel_visible)
+        {
+            for (int row = 0; row < 8; ++row)
+            {
+                const RECT tool_button =
+                    tools_panel_button_area(client_area, row);
+                if (!PtInRect(&tool_button, position))
+                {
+                    continue;
+                }
+                switch (row)
+                {
+                case 0:
+                    toggle_selected_particles_fixed(window);
+                    break;
+                case 1:
+                    if (molecular_tool != MolecularTool::multi_select &&
+                        selected_particles.empty() &&
+                        selected_molecule_id > 0 &&
+                        selected_molecule_id <=
+                            simulation_engine.particles().size())
+                    {
+                        selected_particles.push_back(
+                            static_cast<std::size_t>(
+                                selected_molecule_id - 1));
+                    }
+                    molecular_tool =
+                        molecular_tool == MolecularTool::multi_select
+                        ? MolecularTool::select
+                        : MolecularTool::multi_select;
+                    square_lattice_for_scenario = false;
+                    molecule_tool_active = false;
+                    bond_tool_active = false;
+                    square_lattice_dragging = false;
+                    invalidate_simulation_ui(window, true);
+                    break;
+                case 2:
+                    configure_square_lattice(window);
+                    break;
+                case 3:
+                    show_scenario_step_menu(window);
+                    break;
+                case 4:
+                    toggle_scenario(window);
+                    break;
+                case 5:
+                    clear_scenario(window);
+                    break;
+                case 6:
+                    wall_tool_active = !wall_tool_active;
+                    molecule_tool_active = false;
+                    bond_tool_active = false;
+                    molecular_tool = MolecularTool::select;
+                    square_lattice_dragging = false;
+                    square_lattice_for_scenario = false;
+                    wall_dragging = false;
+                    invalidate_simulation_ui(window, true);
+                    break;
+                case 7:
+                    toggle_dimension_mode(window);
+                    break;
+                default:
+                    break;
+                }
+                return 0;
+            }
+        }
+        const RECT footer = footer_area(client_area);
+        const RECT footer_close{
+            footer.right - 34, footer.top,
+            footer.right - 4, footer.top + 24};
+        if (footer_visible &&
+            PtInRect(&footer_close, position))
+        {
+            footer_visible = false;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        const RECT toolbar_close{
+            client_area.right - 34, client_area.top,
+            client_area.right - 4,
+            client_area.top + toolbar_height};
+        if (toolbar_visible &&
+            PtInRect(&toolbar_close, position))
+        {
+            toolbar_visible = false;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        if (toolbar_visible && PtInRect(&help_button, position))
+        {
+            SetFocus(window);
+            show_help(window);
+            return 0;
+        }
+        if (toolbar_visible && PtInRect(&auto_button, position))
         {
             SetFocus(window);
             configure_graphics_for_this_pc(window);
             return 0;
         }
-        if (PtInRect(&restart_button, position))
+        if (toolbar_visible && PtInRect(&restart_button, position))
         {
             SetFocus(window);
             restart_application(window);
             return 0;
         }
-        if (PtInRect(&interaction_button, position))
+        if (toolbar_visible && PtInRect(&interaction_button, position))
         {
             SetFocus(window);
             show_interaction_menu(window);
             return 0;
         }
-        if (PtInRect(&graphics_button, position))
+        if (toolbar_visible && PtInRect(&graphics_button, position))
         {
             SetFocus(window);
             show_graphics_menu(window);
             return 0;
         }
-        if (PtInRect(&simulation_button, position))
+        if (toolbar_visible && PtInRect(&simulation_button, position))
         {
             SetFocus(window);
             set_simulation_running(window, !simulation_running);
             return 0;
         }
-        if (PtInRect(&button_area, position))
+        if (toolbar_visible && PtInRect(&button_area, position))
         {
             SetFocus(window);
             set_molecule_tool(window, !molecule_tool_active);
@@ -2960,6 +5557,51 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         if (bond_tool_active && PtInRect(&area, position))
         {
             select_bond_endpoint(window, position);
+            return 0;
+        }
+        if (molecular_tool == MolecularTool::square_lattice &&
+            PtInRect(&area, position))
+        {
+            Vec3 world_position{};
+            const double placement_z =
+                simulation_engine.config().two_dimensional
+                ? 0.0 : molecule_placement_height;
+            if (screen_to_plane(client_area, position,
+                    placement_z, world_position))
+            {
+                square_lattice_start = world_position;
+                square_lattice_end = world_position;
+                square_lattice_dragging = true;
+                SetCapture(window);
+                InvalidateRect(window, &area, FALSE);
+            }
+            return 0;
+        }
+        if (wall_tool_active && PtInRect(&area, position))
+        {
+            const bool two_dimensional =
+                simulation_engine.config().two_dimensional;
+            const double wall_z = two_dimensional
+                ? 0.0 : std::round(camera_state.target.z);
+            Vec3 world_position{};
+            if (screen_to_plane(client_area, position, wall_z,
+                    world_position))
+            {
+                wall_start = Vec3{
+                    std::round(world_position.x),
+                    std::round(world_position.y), wall_z};
+                wall_end = wall_start;
+                wall_dragging = true;
+                SetCapture(window);
+                InvalidateRect(window, &area, FALSE);
+            }
+            return 0;
+        }
+        if (molecular_tool == MolecularTool::multi_select &&
+            PtInRect(&area, position))
+        {
+            select_or_toggle_particle(window,
+                pick_molecule(client_area, position));
             return 0;
         }
         if (molecule_tool_active && PtInRect(&area, position))
@@ -3092,9 +5734,11 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         }
         RECT client_area{};
         GetClientRect(window, &client_area);
-        const RECT footer{client_area.left, client_area.bottom - footer_height,
-            client_area.right, client_area.bottom};
-        InvalidateRect(window, &footer, FALSE);
+        const RECT footer = footer_area(client_area);
+        if (footer_visible)
+        {
+            InvalidateRect(window, &footer, FALSE);
+        }
         return 0;
     }
 
@@ -3120,6 +5764,17 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
     if (message == WM_DESTROY)
     {
+        separate_interface_windows = false;
+        if (detached_settings_window != nullptr)
+        {
+            DestroyWindow(detached_settings_window);
+            detached_settings_window = nullptr;
+        }
+        if (detached_interface_window != nullptr)
+        {
+            DestroyWindow(detached_interface_window);
+            detached_interface_window = nullptr;
+        }
         KillTimer(window, camera_timer_id);
         KillTimer(window, telemetry_timer_id);
         KillTimer(window, simulation_timer_id);
@@ -3183,6 +5838,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command)
         return 1;
     }
 
+    main_window = window;
     ShowWindow(window, show_command);
     SetTimer(window, telemetry_timer_id, 100, nullptr);
     UpdateWindow(window);
