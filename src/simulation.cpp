@@ -617,6 +617,17 @@ bool Engine::set_charge(std::size_t index, double charge)
     return true;
 }
 
+bool Engine::set_particle_element(std::size_t index, int atomic_number)
+{
+    if (index >= particles_.size() || atomic_number < 1 ||
+        atomic_number > 118)
+    {
+        return false;
+    }
+    particles_[index].atomic_number = atomic_number;
+    return true;
+}
+
 bool Engine::set_particle_properties(std::size_t index, double mass,
     double charge, double sigma, double epsilon, bool fixed)
 {

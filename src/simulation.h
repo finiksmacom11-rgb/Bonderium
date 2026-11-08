@@ -20,6 +20,7 @@ struct Particle
     Vec3 velocity;
     Vec3 force;
     Vec3 external_force;
+    int atomic_number = 6;
     double mass = 1.0;
     double charge = 0.0;
     double sigma = 0.75;
@@ -128,6 +129,7 @@ public:
     bool set_external_force(std::size_t index, Vec3 force);
     bool set_particle_fixed(std::size_t index, bool fixed);
     bool set_charge(std::size_t index, double charge);
+    bool set_particle_element(std::size_t index, int atomic_number);
     bool set_particle_properties(std::size_t index, double mass, double charge,
         double sigma, double epsilon, bool fixed);
     void clear();

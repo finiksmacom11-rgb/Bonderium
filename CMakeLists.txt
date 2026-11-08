@@ -10,6 +10,7 @@ set(BONDERIUM_VERSION "${PROJECT_VERSION}" CACHE STRING "Application version")
 option(BONDERIUM_ENABLE_UPDATES "Check GitHub Releases for application updates" OFF)
 
 add_executable(Bonderium WIN32
+    src/elements.cpp
     src/main.cpp
     src/simulation.cpp
     src/updater.cpp
@@ -35,6 +36,19 @@ if(BUILD_TESTING)
         target_compile_options(SimulationTests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME SimulationTests COMMAND SimulationTests)
+
+    add_executable(ElementTests
+        tests/elements_tests.cpp
+        src/elements.cpp
+    )
+    target_compile_features(ElementTests PRIVATE cxx_std_20)
+    target_include_directories(ElementTests PRIVATE src)
+    if(MSVC)
+        target_compile_options(ElementTests PRIVATE /W4 /permissive- /utf-8)
+    else()
+        target_compile_options(ElementTests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME ElementTests COMMAND ElementTests)
 endif()
 
 if(MSVC)

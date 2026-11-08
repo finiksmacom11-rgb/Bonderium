@@ -424,6 +424,18 @@ void test_three_dimensional_plane_wall_reflects_swept_particle()
     assert(engine.particles()[particle].position.z < 0.0);
     assert(engine.particles()[particle].velocity.z < 0.0);
 }
+
+void test_particle_element_identity()
+{
+    simulation::Engine engine;
+    const std::size_t particle = engine.add_particle({0.0, 0.0, 0.0});
+    assert(engine.particles()[particle].atomic_number == 6);
+    assert(engine.set_particle_element(particle, 8));
+    assert(engine.particles()[particle].atomic_number == 8);
+    assert(!engine.set_particle_element(particle, 0));
+    assert(!engine.set_particle_element(particle, 119));
+    assert(!engine.set_particle_element(particle + 1, 1));
+}
 }
 
 int main()
@@ -447,6 +459,7 @@ int main()
     test_dimension_mode_constrains_particles_to_xy();
     test_two_dimensional_line_wall_reflects_swept_particle();
     test_three_dimensional_plane_wall_reflects_swept_particle();
+    test_particle_element_identity();
     std::cout << "Simulation tests passed.\n";
     return 0;
 }

@@ -3,6 +3,7 @@
 #include <psapi.h>
 #include <shellapi.h>
 
+#include "elements.h"
 #include "simulation.h"
 #include "updater.h"
 
@@ -12,6 +13,8 @@
 #include <cstdint>
 #include <cwchar>
 #include <iterator>
+#include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,26 +27,13 @@ constexpr wchar_t detached_interface_class_name[] =
 constexpr wchar_t detached_settings_class_name[] =
     L"BonderiumDetachedSettings";
 constexpr wchar_t chart_window_class_name[] = L"BonderiumChartWindow";
+constexpr wchar_t element_table_window_class_name[] =
+    L"BonderiumElementTable";
 
 constexpr int toolbar_height = 62;
 constexpr int footer_height = 116;
 constexpr int tools_panel_width = 220;
-constexpr int molecule_tool_left = 258;
-constexpr int molecule_tool_width = 148;
-constexpr int molecule_tool_top = 14;
-constexpr int molecule_tool_height = 34;
-constexpr int help_tool_left = 226;
-constexpr int help_tool_width = 28;
-constexpr int help_tool_top = 18;
-constexpr int help_tool_height = 26;
-constexpr int simulation_tool_left = 420;
-constexpr int simulation_tool_width = 126;
-constexpr int simulation_tool_top = 14;
-constexpr int simulation_tool_height = 34;
-constexpr int graphics_tool_left = 724;
-constexpr int graphics_tool_width = 60;
-constexpr int graphics_tool_top = 14;
-constexpr int graphics_tool_height = 34;
+constexpr int workspace_rail_width = 60;
 constexpr int interaction_tool_left = 798;
 constexpr int interaction_tool_width = 112;
 constexpr int interaction_tool_top = 14;
@@ -76,23 +66,81 @@ constexpr double camera_move_speed = 12.0;
 constexpr double camera_ease_seconds = 0.12;
 constexpr double camera_stop_threshold = 0.015;
 constexpr double molecule_radius = 0.42;
-constexpr double molecule_sigma = 0.75;
-constexpr double molecule_epsilon = 0.1;
 constexpr double spring_drag_stiffness = 30.0;
 constexpr double directional_force_scale = 18.0;
 constexpr double maximum_interaction_force = 200.0;
 constexpr double field_of_view = 45.0;
 constexpr double pi = 3.14159265358979323846;
 
-constexpr COLORREF canvas_color = RGB(10, 14, 22);
-constexpr COLORREF toolbar_color = RGB(15, 20, 30);
-constexpr COLORREF footer_color = RGB(13, 18, 27);
-constexpr COLORREF border_color = RGB(37, 49, 66);
-constexpr COLORREF primary_text_color = RGB(228, 236, 247);
-constexpr COLORREF muted_text_color = RGB(128, 144, 164);
-constexpr COLORREF x_axis_color = RGB(69, 214, 201);
-constexpr COLORREF y_axis_color = RGB(160, 132, 255);
-constexpr COLORREF z_axis_color = RGB(255, 174, 94);
+COLORREF canvas_color = RGB(10, 14, 22);
+COLORREF toolbar_color = RGB(15, 20, 30);
+COLORREF footer_color = RGB(13, 18, 27);
+COLORREF border_color = RGB(37, 49, 66);
+COLORREF primary_text_color = RGB(228, 236, 247);
+COLORREF muted_text_color = RGB(128, 144, 164);
+COLORREF x_axis_color = RGB(69, 214, 201);
+COLORREF y_axis_color = RGB(160, 132, 255);
+COLORREF z_axis_color = RGB(255, 174, 94);
+COLORREF surface_color = RGB(20, 27, 39);
+COLORREF active_surface_color = RGB(26, 55, 61);
+
+enum class VisualStyle
+{
+    deep_space,
+    arctic,
+    forest,
+    amber,
+    orchid
+};
+
+enum class WorkspacePage
+{
+    closed,
+    objects,
+    thermodynamics,
+    dynamics,
+    quantum,
+    settings,
+    experiments
+};
+
+struct VisualPalette
+{
+    COLORREF canvas;
+    COLORREF toolbar;
+    COLORREF panel;
+    COLORREF border;
+    COLORREF text;
+    COLORREF muted;
+    COLORREF accent;
+    COLORREF secondary;
+    COLORREF tertiary;
+    COLORREF surface;
+    COLORREF active_surface;
+};
+
+constexpr VisualPalette visual_palettes[]{
+    {RGB(10, 14, 22), RGB(15, 20, 30), RGB(13, 18, 27),
+        RGB(37, 49, 66), RGB(228, 236, 247), RGB(128, 144, 164),
+        RGB(69, 214, 201), RGB(160, 132, 255), RGB(255, 174, 94),
+        RGB(20, 27, 39), RGB(26, 55, 61)},
+    {RGB(12, 21, 31), RGB(19, 32, 45), RGB(16, 28, 40),
+        RGB(45, 70, 88), RGB(229, 242, 250), RGB(135, 165, 184),
+        RGB(92, 207, 240), RGB(120, 171, 235), RGB(113, 220, 199),
+        RGB(24, 42, 57), RGB(31, 72, 91)},
+    {RGB(12, 22, 20), RGB(19, 34, 30), RGB(16, 29, 26),
+        RGB(43, 72, 59), RGB(230, 242, 232), RGB(142, 171, 151),
+        RGB(104, 214, 156), RGB(152, 205, 132), RGB(228, 190, 104),
+        RGB(23, 43, 35), RGB(31, 72, 53)},
+    {RGB(25, 17, 13), RGB(38, 27, 20), RGB(31, 23, 18),
+        RGB(83, 60, 42), RGB(250, 239, 222), RGB(184, 155, 126),
+        RGB(255, 177, 91), RGB(237, 129, 83), RGB(244, 211, 126),
+        RGB(49, 34, 24), RGB(87, 52, 29)},
+    {RGB(20, 15, 29), RGB(31, 23, 44), RGB(26, 20, 38),
+        RGB(67, 52, 91), RGB(240, 232, 250), RGB(166, 148, 191),
+        RGB(202, 132, 255), RGB(132, 162, 255), RGB(255, 142, 203),
+        RGB(38, 28, 55), RGB(69, 42, 91)}
+};
 
 enum class GraphicsQuality
 {
@@ -236,8 +284,10 @@ std::uint64_t process_private_bytes = 0;
 bool process_memory_available = false;
 bool grid_visible = true;
 bool toolbar_visible = true;
-bool footer_visible = true;
-bool tools_panel_visible = true;
+bool footer_visible = false;
+bool tools_panel_visible = false;
+VisualStyle visual_style = VisualStyle::deep_space;
+WorkspacePage workspace_page = WorkspacePage::closed;
 bool fullscreen = false;
 bool separate_interface_windows = false;
 double time_flow_factor = 1.0;
@@ -250,6 +300,9 @@ HWND detached_interface_window = nullptr;
 HWND detached_settings_window = nullptr;
 HBRUSH detached_settings_background = nullptr;
 HWND chart_window = nullptr;
+HWND element_table_window = nullptr;
+HWND element_search_edit = nullptr;
+HBRUSH element_search_background = nullptr;
 std::vector<std::size_t> chart_particle_indices;
 std::vector<ChartSample> chart_samples;
 std::size_t chart_next_sample = 0;
@@ -275,6 +328,8 @@ bool scenario_running = false;
 double scenario_elapsed_seconds = 0.0;
 std::size_t active_scenario_step = static_cast<std::size_t>(-1);
 std::size_t square_lattice_count = 25;
+int selected_element_number = 6;
+int highlighted_element_number = 6;
 bool square_lattice_dragging = false;
 bool square_lattice_for_scenario = false;
 double pending_lattice_duration = 1.0;
@@ -294,6 +349,7 @@ std::size_t interacting_particle = static_cast<std::size_t>(-1);
 std::uint64_t selected_molecule_id = 0;
 Vec3 molecule_drag_offset{};
 POINT pointer_position{};
+POINT workspace_pointer_position{};
 POINT drag_last_position{};
 POINT force_drag_start_position{};
 
@@ -331,9 +387,104 @@ Vec3 normalized(Vec3 vector)
     return length > 1e-12 ? vector * (1.0 / length) : Vec3{};
 }
 
+COLORREF element_color(int atomic_number)
+{
+    const elements::Element* element = elements::find(atomic_number);
+    if (element == nullptr)
+    {
+        return primary_text_color;
+    }
+    const unsigned int color = elements::category_color(element->category);
+    return RGB((color >> 16U) & 0xFFU, (color >> 8U) & 0xFFU,
+        color & 0xFFU);
+}
+
+double element_model_mass(const elements::Element& element)
+{
+    return element.atomic_mass / 12.011;
+}
+
+double element_model_sigma(const elements::Element& element)
+{
+    return (std::clamp)(element.covalent_radius_pm * 0.0075, 0.35, 1.8);
+}
+
+double element_model_epsilon(const elements::Element& element)
+{
+    switch (element.category)
+    {
+    case elements::Category::noble_gas: return 0.06;
+    case elements::Category::alkali_metal:
+    case elements::Category::alkaline_earth_metal:
+    case elements::Category::transition_metal:
+    case elements::Category::post_transition_metal: return 0.16;
+    default: return 0.1;
+    }
+}
+
+bool configure_particle_element(std::size_t particle_index,
+    int atomic_number, double charge = 0.0, bool fixed = false)
+{
+    const elements::Element* element = elements::find(atomic_number);
+    if (element == nullptr)
+    {
+        return false;
+    }
+    return simulation_engine.set_particle_properties(particle_index,
+               element_model_mass(*element), charge,
+               element_model_sigma(*element),
+               element_model_epsilon(*element), fixed) &&
+        simulation_engine.set_particle_element(particle_index, atomic_number);
+}
+
 int scene_width(const RECT& client_area)
 {
     return (std::max)(1, static_cast<int>(client_area.right - client_area.left));
+}
+
+void apply_visual_style(VisualStyle style)
+{
+    const std::size_t index = static_cast<std::size_t>(style);
+    if (index >= std::size(visual_palettes))
+    {
+        return;
+    }
+    visual_style = style;
+    const VisualPalette& palette = visual_palettes[index];
+    canvas_color = palette.canvas;
+    toolbar_color = palette.toolbar;
+    footer_color = palette.panel;
+    border_color = palette.border;
+    primary_text_color = palette.text;
+    muted_text_color = palette.muted;
+    x_axis_color = palette.accent;
+    y_axis_color = palette.secondary;
+    z_axis_color = palette.tertiary;
+    surface_color = palette.surface;
+    active_surface_color = palette.active_surface;
+    if (element_table_window != nullptr)
+    {
+        HBRUSH themed_background = CreateSolidBrush(surface_color);
+        if (themed_background == nullptr)
+        {
+            MessageBoxW(main_window,
+                L"Не удалось обновить фон поля поиска элементов.",
+                L"Настройки оформления", MB_OK | MB_ICONERROR);
+        }
+        else
+        {
+            if (element_search_background != nullptr)
+            {
+                DeleteObject(element_search_background);
+            }
+            element_search_background = themed_background;
+        }
+        InvalidateRect(element_table_window, nullptr, FALSE);
+    }
+    if (chart_window != nullptr)
+    {
+        InvalidateRect(chart_window, nullptr, FALSE);
+    }
 }
 
 RECT scene_area(const RECT& client_area)
@@ -343,13 +494,14 @@ RECT scene_area(const RECT& client_area)
     const int bottom = (std::max)(top,
         static_cast<int>(client_area.bottom) -
             (!separate_interface_windows && footer_visible ? footer_height : 0));
-    return RECT{
-        client_area.left, top,
-        (std::max)(client_area.left,
-            client_area.right -
-                (!separate_interface_windows && tools_panel_visible
-                    ? tools_panel_width : 0)),
-        bottom};
+    if (separate_interface_windows)
+    {
+        return RECT{client_area.left, top, client_area.right, bottom};
+    }
+    const int left = (std::min)(client_area.right,
+        client_area.left + workspace_rail_width +
+            (tools_panel_visible ? tools_panel_width : 0));
+    return RECT{left, top, client_area.right, bottom};
 }
 
 RECT toolbar_area(const RECT& client_area)
@@ -367,6 +519,17 @@ RECT footer_area(const RECT& client_area)
 
 RECT tools_panel_area(const RECT& client_area)
 {
+    if (!separate_interface_windows)
+    {
+        return RECT{
+            client_area.left + workspace_rail_width,
+            client_area.top + (toolbar_visible ? toolbar_height : 0),
+            (std::min)(client_area.right,
+                client_area.left + workspace_rail_width + tools_panel_width),
+            client_area.bottom -
+                (!separate_interface_windows && footer_visible
+                    ? footer_height : 0)};
+    }
     return RECT{
         client_area.right - tools_panel_width,
         client_area.top + (toolbar_visible ? toolbar_height : 0),
@@ -377,8 +540,8 @@ RECT tools_panel_area(const RECT& client_area)
 RECT tools_panel_button_area(const RECT& client_area, int row)
 {
     const RECT panel = tools_panel_area(client_area);
-    const int top = panel.top + 48 + row * 40;
-    return RECT{panel.left + 12, top, panel.right - 12, top + 32};
+    const int top = panel.top + 48 + row * 36;
+    return RECT{panel.left + 12, top, panel.right - 12, top + 30};
 }
 
 bool rectangles_intersect(const RECT& first, const RECT& second)
@@ -390,34 +553,21 @@ bool rectangles_intersect(const RECT& first, const RECT& second)
 RECT molecule_tool_area(const RECT& client_area)
 {
     return RECT{
-        client_area.left + molecule_tool_left,
-        client_area.top + molecule_tool_top,
-        client_area.left + molecule_tool_left + molecule_tool_width,
-        client_area.top + molecule_tool_top + molecule_tool_height};
-}
-
-RECT help_tool_area(const RECT& client_area)
-{
-    return RECT{
-        client_area.left + help_tool_left,
-        client_area.top + help_tool_top,
-        client_area.left + help_tool_left + help_tool_width,
-        client_area.top + help_tool_top + help_tool_height};
+        client_area.left + 260, client_area.top + 12,
+        client_area.left + 304, client_area.top + 50};
 }
 
 RECT simulation_tool_area(const RECT& client_area)
 {
         return RECT{
-            client_area.left + simulation_tool_left,
-            client_area.top + simulation_tool_top,
-            client_area.left + simulation_tool_left + simulation_tool_width,
-            client_area.top + simulation_tool_top + simulation_tool_height};
+            client_area.left + 320, client_area.top + 12,
+            client_area.left + 364, client_area.top + 50};
 }
 
 RECT time_flow_slider_area(const RECT& client_area)
 {
-    return RECT{client_area.left + 554, client_area.top + 12,
-        client_area.left + 648, client_area.top + 52};
+    return RECT{client_area.left + 390, client_area.top + 8,
+        client_area.left + 560, client_area.top + 54};
 }
 
 void set_time_flow_from_pointer(HWND window, POINT position)
@@ -442,10 +592,8 @@ void set_time_flow_from_pointer(HWND window, POINT position)
 RECT graphics_tool_area(const RECT& client_area)
 {
     return RECT{
-        client_area.left + graphics_tool_left,
-        client_area.top + graphics_tool_top,
-        client_area.left + graphics_tool_left + graphics_tool_width,
-        client_area.top + graphics_tool_top + graphics_tool_height};
+        client_area.left + 580, client_area.top + 12,
+        client_area.left + 624, client_area.top + 50};
 }
 
 RECT interaction_tool_area(const RECT& client_area)
@@ -473,6 +621,204 @@ RECT restart_tool_area(const RECT& client_area)
                 client_area.top + restart_tool_top,
                 client_area.left + restart_tool_left + restart_tool_width,
                 client_area.top + restart_tool_top + restart_tool_height};
+}
+
+RECT workspace_category_area(const RECT& client_area, WorkspacePage page)
+{
+    const int page_index = static_cast<int>(page) - 1;
+    const int top = client_area.top + toolbar_height + 22 + page_index * 52;
+    return RECT{client_area.left + 10, top,
+        client_area.left + workspace_rail_width - 10, top + 40};
+}
+
+RECT molecule_tool_area(const RECT& client_area);
+RECT simulation_tool_area(const RECT& client_area);
+RECT graphics_tool_area(const RECT& client_area);
+
+int hovered_ui_target(const RECT& client_area, POINT position)
+{
+    const WorkspacePage pages[]{
+        WorkspacePage::objects, WorkspacePage::thermodynamics,
+        WorkspacePage::dynamics, WorkspacePage::quantum,
+        WorkspacePage::settings, WorkspacePage::experiments};
+    for (std::size_t index = 0; index < std::size(pages); ++index)
+    {
+        const RECT button = workspace_category_area(client_area, pages[index]);
+        if (PtInRect(&button, position))
+        {
+            return static_cast<int>(index);
+        }
+    }
+    const RECT buttons[]{
+        molecule_tool_area(client_area),
+        simulation_tool_area(client_area),
+        graphics_tool_area(client_area)};
+    for (std::size_t index = 0; index < std::size(buttons); ++index)
+    {
+        if (PtInRect(&buttons[index], position))
+        {
+            return 10 + static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+void fill_rectangle(HDC device_context, const RECT& area, COLORREF color);
+void draw_line(HDC device_context, int x1, int y1, int x2, int y2,
+    COLORREF color, int width = 1);
+void draw_text(HDC device_context, const wchar_t* text, RECT area,
+    COLORREF color, HFONT font, UINT alignment = DT_LEFT);
+
+void draw_icon(HDC context, RECT area, int icon, COLORREF color)
+{
+    HPEN pen = CreatePen(PS_SOLID, 2, color);
+    HPEN previous = static_cast<HPEN>(SelectObject(context, pen));
+    HBRUSH previous_brush = static_cast<HBRUSH>(
+        SelectObject(context, GetStockObject(HOLLOW_BRUSH)));
+    const int cx = (area.left + area.right) / 2;
+    const int cy = (area.top + area.bottom) / 2;
+    switch (icon)
+    {
+    case 0:
+        Ellipse(context, cx - 7, cy - 7, cx + 7, cy + 7);
+        MoveToEx(context, cx - 12, cy, nullptr);
+        LineTo(context, cx + 12, cy);
+        MoveToEx(context, cx, cy - 12, nullptr);
+        LineTo(context, cx, cy + 12);
+        break;
+    case 1:
+        MoveToEx(context, cx, cy - 9, nullptr);
+        LineTo(context, cx, cy + 4);
+        Ellipse(context, cx - 5, cy + 2, cx + 5, cy + 12);
+        Ellipse(context, cx - 3, cy - 12, cx + 3, cy - 6);
+        break;
+    case 2:
+        MoveToEx(context, cx - 10, cy + 8, nullptr);
+        LineTo(context, cx - 4, cy + 1);
+        LineTo(context, cx + 1, cy + 5);
+        LineTo(context, cx + 9, cy - 8);
+        break;
+    case 3:
+        Ellipse(context, cx - 11, cy - 5, cx + 11, cy + 5);
+        Ellipse(context, cx - 5, cy - 11, cx + 5, cy + 11);
+        Ellipse(context, cx - 2, cy - 2, cx + 2, cy + 2);
+        break;
+    case 4:
+        Ellipse(context, cx - 6, cy - 6, cx + 6, cy + 6);
+        for (int angle = 0; angle < 8; ++angle)
+        {
+            const double radians = angle * pi / 4.0;
+            MoveToEx(context,
+                cx + static_cast<int>(std::cos(radians) * 8.0),
+                cy + static_cast<int>(std::sin(radians) * 8.0), nullptr);
+            LineTo(context,
+                cx + static_cast<int>(std::cos(radians) * 12.0),
+                cy + static_cast<int>(std::sin(radians) * 12.0));
+        }
+        break;
+    case 5:
+        if (simulation_running)
+        {
+            MoveToEx(context, cx - 5, cy - 8, nullptr);
+            LineTo(context, cx - 5, cy + 8);
+            MoveToEx(context, cx + 5, cy - 8, nullptr);
+            LineTo(context, cx + 5, cy + 8);
+        }
+        else
+        {
+            POINT triangle[]{
+                {cx - 6, cy - 9}, {cx + 9, cy}, {cx - 6, cy + 9}};
+            Polygon(context, triangle, 3);
+        }
+        break;
+    case 6:
+        Ellipse(context, cx - 8, cy - 10, cx + 8, cy + 6);
+        MoveToEx(context, cx - 6, cy + 6, nullptr);
+        LineTo(context, cx - 3, cy + 11);
+        LineTo(context, cx + 3, cy + 11);
+        LineTo(context, cx + 6, cy + 6);
+        MoveToEx(context, cx, cy - 15, nullptr);
+        LineTo(context, cx, cy - 10);
+        MoveToEx(context, cx - 12, cy - 5, nullptr);
+        LineTo(context, cx - 8, cy - 3);
+        MoveToEx(context, cx + 12, cy - 5, nullptr);
+        LineTo(context, cx + 8, cy - 3);
+        break;
+    }
+    SelectObject(context, previous_brush);
+    SelectObject(context, previous);
+    DeleteObject(pen);
+}
+
+const wchar_t* workspace_page_title(WorkspacePage page)
+{
+    switch (page)
+    {
+    case WorkspacePage::objects: return L"ОБЪЕКТЫ";
+    case WorkspacePage::thermodynamics: return L"ТЕРМОДИНАМИКА";
+    case WorkspacePage::dynamics: return L"ДИНАМИКА";
+    case WorkspacePage::quantum: return L"КВАНТОВАЯ ДИНАМИКА";
+    case WorkspacePage::settings: return L"НАСТРОЙКИ";
+    case WorkspacePage::experiments: return L"ЛАБОРАТОРИЯ";
+    default: return L"";
+    }
+}
+
+const wchar_t* workspace_page_hint(WorkspacePage page)
+{
+    switch (page)
+    {
+    case WorkspacePage::objects: return L"Молекулы и инструменты";
+    case WorkspacePage::thermodynamics: return L"Состояние системы";
+    case WorkspacePage::dynamics: return L"Параметры симуляции";
+    case WorkspacePage::quantum: return L"Квантовый модуль";
+    case WorkspacePage::settings: return L"Оформление и окно";
+    case WorkspacePage::experiments: return L"Инструменты опытов";
+    default: return L"";
+    }
+}
+
+void draw_workspace_rail(HDC context, const RECT& client_area)
+{
+    RECT rail{client_area.left, client_area.top + toolbar_height,
+        client_area.left + workspace_rail_width, client_area.bottom};
+    fill_rectangle(context, rail, toolbar_color);
+    draw_line(context, rail.right - 1, rail.top,
+        rail.right - 1, rail.bottom, border_color);
+    const WorkspacePage pages[]{
+        WorkspacePage::objects,
+        WorkspacePage::thermodynamics,
+        WorkspacePage::dynamics,
+        WorkspacePage::quantum,
+        WorkspacePage::settings,
+        WorkspacePage::experiments};
+    const wchar_t* labels[]{
+        L"Объекты", L"Термодинамика", L"Динамика",
+        L"Квантовая динамика", L"Настройки", L"Лаборатория"};
+    for (std::size_t index = 0; index < std::size(pages); ++index)
+    {
+        const RECT button = workspace_category_area(client_area, pages[index]);
+        const bool active = workspace_page == pages[index];
+        const bool hovered = PtInRect(&button, workspace_pointer_position) != FALSE;
+        if (active || hovered)
+        {
+            fill_rectangle(context, button,
+                active ? active_surface_color : surface_color);
+            draw_line(context, button.left, button.top + 6,
+                button.left, button.bottom - 6,
+                active ? x_axis_color : border_color, active ? 3 : 1);
+        }
+        draw_icon(context, button, index == 5 ? 6 : static_cast<int>(index),
+            active ? x_axis_color : muted_text_color);
+        if (hovered)
+        {
+            RECT tooltip{button.right + 8, button.top + 7,
+                button.right + 168, button.bottom - 7};
+            fill_rectangle(context, tooltip, surface_color);
+            draw_text(context, labels[index], tooltip,
+                muted_text_color, small_font);
+        }
+    }
 }
 
 bool create_overlay_fonts(int dpi = 96)
@@ -562,7 +908,7 @@ void fill_rectangle(HDC device_context, const RECT& area, COLORREF color)
 }
 
 void draw_line(HDC device_context, int x1, int y1, int x2, int y2,
-    COLORREF color, int width = 1)
+    COLORREF color, int width)
 {
     HPEN pen = CreatePen(PS_SOLID, width, color);
     HPEN previous_pen = static_cast<HPEN>(SelectObject(device_context, pen));
@@ -573,7 +919,7 @@ void draw_line(HDC device_context, int x1, int y1, int x2, int y2,
 }
 
 void draw_text(HDC device_context, const wchar_t* text, RECT area,
-    COLORREF color, HFONT font, UINT alignment = DT_LEFT)
+    COLORREF color, HFONT font, UINT alignment)
 {
     HFONT previous_font = static_cast<HFONT>(SelectObject(device_context, font));
     SetBkMode(device_context, TRANSPARENT);
@@ -787,7 +1133,11 @@ void draw_grid()
             continue;
         }
         const bool major = x % 5 == 0;
-        glColor4ub(major ? 36 : 25, major ? 49 : 34, major ? 65 : 47, 255);
+        const double shade = major ? 1.0 : 0.68;
+        glColor4ub(
+            static_cast<GLubyte>(GetRValue(border_color) * shade),
+            static_cast<GLubyte>(GetGValue(border_color) * shade),
+            static_cast<GLubyte>(GetBValue(border_color) * shade), 255);
         glVertex3d(x, minimum_y, 0.0);
         glVertex3d(x, maximum_y, 0.0);
     }
@@ -798,7 +1148,11 @@ void draw_grid()
             continue;
         }
         const bool major = y % 5 == 0;
-        glColor4ub(major ? 36 : 25, major ? 49 : 34, major ? 65 : 47, 255);
+        const double shade = major ? 1.0 : 0.68;
+        glColor4ub(
+            static_cast<GLubyte>(GetRValue(border_color) * shade),
+            static_cast<GLubyte>(GetGValue(border_color) * shade),
+            static_cast<GLubyte>(GetBValue(border_color) * shade), 255);
         glVertex3d(minimum_x, y, 0.0);
         glVertex3d(maximum_x, y, 0.0);
     }
@@ -806,13 +1160,16 @@ void draw_grid()
 
     glLineWidth(2.0F);
     glBegin(GL_LINES);
-    glColor3ub(69, 214, 201);
+    glColor3ub(GetRValue(x_axis_color), GetGValue(x_axis_color),
+        GetBValue(x_axis_color));
     glVertex3d(minimum_x, 0.0, 0.025);
     glVertex3d(maximum_x, 0.0, 0.025);
-    glColor3ub(160, 132, 255);
+    glColor3ub(GetRValue(y_axis_color), GetGValue(y_axis_color),
+        GetBValue(y_axis_color));
     glVertex3d(0.0, minimum_y, 0.025);
     glVertex3d(0.0, maximum_y, 0.025);
-    glColor3ub(255, 174, 94);
+    glColor3ub(GetRValue(z_axis_color), GetGValue(z_axis_color),
+        GetBValue(z_axis_color));
     if (!simulation_engine.config().two_dimensional)
     {
         glVertex3d(0.0, 0.0, 0.025);
@@ -841,12 +1198,11 @@ void draw_simulation_boundaries()
         {0, 4}, {1, 5}, {2, 6}, {3, 7}};
     glDisable(GL_LIGHTING);
     glLineWidth(1.5F);
-    glColor3ub(config.boundary_mode == simulation::BoundaryMode::soft
-            ? 255 : 160,
+    const COLORREF boundary_color =
         config.boundary_mode == simulation::BoundaryMode::soft
-            ? 174 : 132,
-        config.boundary_mode == simulation::BoundaryMode::soft
-            ? 94 : 255);
+        ? z_axis_color : y_axis_color;
+    glColor3ub(GetRValue(boundary_color), GetGValue(boundary_color),
+        GetBValue(boundary_color));
     glBegin(GL_LINES);
     for (const auto& edge : edges)
     {
@@ -865,7 +1221,8 @@ void draw_walls()
         simulation_engine.config().two_dimensional;
     glDisable(GL_LIGHTING);
     glLineWidth(3.0F);
-    glColor3ub(69, 214, 201);
+    glColor3ub(GetRValue(x_axis_color), GetGValue(x_axis_color),
+        GetBValue(x_axis_color));
     glBegin(GL_LINES);
     for (const simulation::Wall& wall : simulation_engine.walls())
     {
@@ -893,7 +1250,8 @@ void draw_walls()
     glEnd();
     if (wall_tool_active && wall_dragging)
     {
-        glColor3ub(255, 174, 94);
+        glColor3ub(GetRValue(z_axis_color), GetGValue(z_axis_color),
+            GetBValue(z_axis_color));
         glBegin(GL_LINES);
         if (two_dimensional)
         {
@@ -917,7 +1275,7 @@ void draw_walls()
 }
 
 void draw_sphere(const Vec3& center, double radius, bool preview = false,
-    bool selected = false, double charge = 0.0)
+    bool selected = false, double charge = 0.0, int atomic_number = 6)
 {
     int latitude_steps = 12;
     int longitude_steps = 18;
@@ -936,20 +1294,24 @@ void draw_sphere(const Vec3& center, double radius, bool preview = false,
         glDisable(GL_LIGHTING);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glColor4ub(69, 214, 201, 90);
+        glColor4ub(GetRValue(x_axis_color), GetGValue(x_axis_color),
+            GetBValue(x_axis_color), 90);
     }
     else
     {
         glEnable(GL_LIGHTING);
         if (selected)
         {
-            glColor3ub(116, 204, 188);
+            glColor3ub(GetRValue(x_axis_color), GetGValue(x_axis_color),
+                GetBValue(x_axis_color));
         }
         else
         {
-            glColor3ub(charge > 0.0 ? 225 : charge < 0.0 ? 151 : 69,
-                charge < 0.0 ? 132 : 154,
-                charge > 0.0 ? 110 : charge < 0.0 ? 232 : 160);
+            const COLORREF color = charge > 0.0
+                ? RGB(225, 132, 110)
+                : charge < 0.0 ? RGB(151, 154, 232)
+                               : element_color(atomic_number);
+            glColor3ub(GetRValue(color), GetGValue(color), GetBValue(color));
         }
     }
 
@@ -1001,7 +1363,7 @@ void draw_molecules(const RECT& client_area)
             std::find(selected_particles.begin(), selected_particles.end(),
                 index) != selected_particles.end();
         draw_sphere(position, molecule_radius, false, selected,
-            particles[index].charge);
+            particles[index].charge, particles[index].atomic_number);
     }
 
     Vec3 preview_position{};
@@ -1013,7 +1375,7 @@ void draw_molecules(const RECT& client_area)
     {
         draw_sphere(
             Vec3{preview_position.x, preview_position.y, preview_z},
-            molecule_radius, true);
+            molecule_radius, true, false, 0.0, selected_element_number);
     }
 }
 
@@ -1025,7 +1387,8 @@ void draw_square_lattice_preview()
     }
     glDisable(GL_LIGHTING);
     glLineWidth(2.0F);
-    glColor3ub(69, 214, 201);
+    glColor3ub(GetRValue(x_axis_color), GetGValue(x_axis_color),
+        GetBValue(x_axis_color));
     const double dx = square_lattice_end.x - square_lattice_start.x;
     const double dy = square_lattice_end.y - square_lattice_start.y;
     const double side = (std::max)(std::abs(dx), std::abs(dy));
@@ -1075,7 +1438,8 @@ void draw_bonds()
 {
     glDisable(GL_LIGHTING);
     glLineWidth(2.0F);
-    glColor3ub(255, 174, 94);
+    glColor3ub(GetRValue(z_axis_color), GetGValue(z_axis_color),
+        GetBValue(z_axis_color));
     glBegin(GL_LINES);
     const auto& particles = simulation_engine.particles();
     for (const simulation::Bond& bond : simulation_engine.bonds())
@@ -1110,7 +1474,8 @@ void draw_interaction_force()
         particle.position + particle.external_force * 0.05;
     glDisable(GL_LIGHTING);
     glLineWidth(3.0F);
-    glColor3ub(255, 174, 94);
+    glColor3ub(GetRValue(z_axis_color), GetGValue(z_axis_color),
+        GetBValue(z_axis_color));
     glBegin(GL_LINES);
     glVertex3d(particle.position.x, particle.position.y, particle.position.z);
     glVertex3d(endpoint.x, endpoint.y, endpoint.z);
@@ -1129,7 +1494,9 @@ void render_scene(const RECT& client_area)
     glEnable(GL_SCISSOR_TEST);
     glScissor(area.left, height - area.bottom,
         area.right - area.left, area.bottom - area.top);
-    glClearColor(10.0F / 255.0F, 14.0F / 255.0F, 22.0F / 255.0F, 1.0F);
+    glClearColor(GetRValue(canvas_color) / 255.0F,
+        GetGValue(canvas_color) / 255.0F,
+        GetBValue(canvas_color) / 255.0F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     set_camera_viewport(client_area);
@@ -1173,7 +1540,7 @@ void render_scene(const RECT& client_area)
 }
 
 void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
-    HFONT small_font, HFONT button_font, HFONT status_font)
+    HFONT small_font, HFONT status_font)
 {
     const RECT toolbar = toolbar_area(client_area);
     fill_rectangle(device_context, toolbar, toolbar_color);
@@ -1181,97 +1548,36 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         client_area.right, toolbar.bottom - 1, border_color);
 
     const int brand_center_y = toolbar.top + toolbar_height / 2;
-    draw_filled_circle(device_context, 29, brand_center_y, 8,
-        RGB(21, 57, 65), x_axis_color);
-    RECT title_area{49, toolbar.top + 9, 225, toolbar.top + 35};
+    draw_filled_circle(device_context, workspace_rail_width / 2,
+        brand_center_y, 8, active_surface_color, x_axis_color);
+    RECT title_area{workspace_rail_width + 16, toolbar.top + 8,
+        workspace_rail_width + 188, toolbar.top + 34};
     draw_text(device_context, L"BONDERIUM", title_area,
         primary_text_color, title_font);
-    RECT subtitle_area{50, toolbar.top + 34, 245, toolbar.top + 51};
-    draw_text(device_context, L"3D MOLECULAR SPACE", subtitle_area,
-        muted_text_color, small_font);
-
-    const RECT help_button = help_tool_area(client_area);
-    HPEN help_pen = CreatePen(PS_SOLID, 1, border_color);
-    HBRUSH help_brush = CreateSolidBrush(RGB(20, 27, 39));
-    HPEN previous_help_pen =
-        static_cast<HPEN>(SelectObject(device_context, help_pen));
-    HBRUSH previous_help_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, help_brush));
-    RoundRect(device_context, help_button.left, help_button.top,
-        help_button.right, help_button.bottom, 8, 8);
-    SelectObject(device_context, previous_help_brush);
-    SelectObject(device_context, previous_help_pen);
-    DeleteObject(help_brush);
-    DeleteObject(help_pen);
-    draw_text(device_context, L"?", help_button, x_axis_color,
-        button_font, DT_CENTER);
+    RECT subtitle_area{workspace_rail_width + 17, toolbar.top + 33,
+        workspace_rail_width + 190, toolbar.top + 52};
+    draw_text(device_context,
+        simulation_engine.config().two_dimensional
+            ? L"2D SIMULATION" : L"3D SIMULATION",
+        subtitle_area, muted_text_color, small_font);
 
     const RECT molecule_button = molecule_tool_area(client_area);
-    HPEN button_pen = CreatePen(PS_SOLID, 1,
-        molecule_tool_active ? RGB(69, 142, 139) : border_color);
-    HBRUSH button_brush = CreateSolidBrush(
-        molecule_tool_active ? RGB(26, 55, 61) : RGB(20, 27, 39));
-    HPEN previous_pen = static_cast<HPEN>(SelectObject(device_context, button_pen));
-    HBRUSH previous_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, button_brush));
-    RoundRect(device_context, molecule_button.left, molecule_button.top,
-        molecule_button.right, molecule_button.bottom, 10, 10);
-    SelectObject(device_context, previous_brush);
-    SelectObject(device_context, previous_pen);
-    DeleteObject(button_brush);
-    DeleteObject(button_pen);
-    wchar_t molecule_tool_label[40]{};
-    if (molecule_tool_active)
-    {
-        std::swprintf(molecule_tool_label,
-            sizeof(molecule_tool_label) / sizeof(molecule_tool_label[0]),
-            L"MOLECULE  Z %.1f", molecule_placement_height);
-    }
-    else
-    {
-        std::swprintf(molecule_tool_label,
-            sizeof(molecule_tool_label) / sizeof(molecule_tool_label[0]),
-            L"+  Molecule");
-    }
-    RECT button_text{molecule_button.left + 8, molecule_button.top + 1,
-        molecule_button.right - 8, molecule_button.bottom - 1};
-    draw_text(device_context, molecule_tool_label, button_text,
-        molecule_tool_active ? x_axis_color : primary_text_color,
-        button_font, DT_CENTER);
+    fill_rectangle(device_context, molecule_button,
+        molecule_tool_active ? active_surface_color : surface_color);
+    draw_icon(device_context, molecule_button, 0,
+        molecule_tool_active ? x_axis_color : primary_text_color);
 
     const RECT simulation_button = simulation_tool_area(client_area);
-    const COLORREF simulation_button_fill = simulation_running
-        ? RGB(23, 63, 57)
-        : RGB(20, 27, 39);
-    const COLORREF simulation_button_border = simulation_running
-        ? RGB(58, 158, 126)
-        : border_color;
-    HPEN simulation_pen = CreatePen(PS_SOLID, 1, simulation_button_border);
-    HBRUSH simulation_brush = CreateSolidBrush(simulation_button_fill);
-    HPEN previous_simulation_pen =
-        static_cast<HPEN>(SelectObject(device_context, simulation_pen));
-    HBRUSH previous_simulation_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, simulation_brush));
-    RoundRect(device_context, simulation_button.left, simulation_button.top,
-        simulation_button.right, simulation_button.bottom, 10, 10);
-    SelectObject(device_context, previous_simulation_brush);
-    SelectObject(device_context, previous_simulation_pen);
-    DeleteObject(simulation_brush);
-    DeleteObject(simulation_pen);
-    RECT simulation_label{
-        simulation_button.left + 6, simulation_button.top + 1,
-        simulation_button.right - 6, simulation_button.bottom - 1};
-    draw_text(device_context,
-        simulation_running ? L"PAUSE EXP" : L"START EXP",
-        simulation_label,
-        simulation_running ? x_axis_color : primary_text_color,
-        button_font, DT_CENTER);
+    fill_rectangle(device_context, simulation_button,
+        simulation_running ? active_surface_color : surface_color);
+    draw_icon(device_context, simulation_button, 5,
+        simulation_running ? x_axis_color : primary_text_color);
 
     const RECT time_slider = time_flow_slider_area(client_area);
     wchar_t time_flow_label[24]{};
     std::swprintf(time_flow_label,
         sizeof(time_flow_label) / sizeof(time_flow_label[0]),
-        L"TIME  %.2fx", time_flow_factor);
+        L"ВРЕМЯ  %.2fx", time_flow_factor);
     draw_text(device_context, time_flow_label,
         RECT{time_slider.left, time_slider.top,
             time_slider.right, time_slider.top + 19},
@@ -1292,109 +1598,35 @@ void draw_toolbar(HDC device_context, const RECT& client_area, HFONT title_font,
         primary_text_color, x_axis_color);
 
     const RECT graphics_button = graphics_tool_area(client_area);
-    HPEN graphics_pen = CreatePen(PS_SOLID, 1, border_color);
-    HBRUSH graphics_brush = CreateSolidBrush(RGB(20, 27, 39));
-    HPEN previous_graphics_pen =
-        static_cast<HPEN>(SelectObject(device_context, graphics_pen));
-    HBRUSH previous_graphics_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, graphics_brush));
-    RoundRect(device_context, graphics_button.left, graphics_button.top,
-        graphics_button.right, graphics_button.bottom, 10, 10);
-    SelectObject(device_context, previous_graphics_brush);
-    SelectObject(device_context, previous_graphics_pen);
-    DeleteObject(graphics_brush);
-    DeleteObject(graphics_pen);
-    draw_text(device_context, L"OPT", graphics_button, primary_text_color,
-        button_font, DT_CENTER);
+    fill_rectangle(device_context, graphics_button, surface_color);
+    draw_icon(device_context, graphics_button, 4, primary_text_color);
 
-    const RECT interaction_button = interaction_tool_area(client_area);
-    HPEN interaction_pen = CreatePen(PS_SOLID, 1, border_color);
-    HBRUSH interaction_brush = CreateSolidBrush(
-        molecule_dragging ? RGB(26, 55, 61) : RGB(20, 27, 39));
-    HPEN previous_interaction_pen =
-        static_cast<HPEN>(SelectObject(device_context, interaction_pen));
-    HBRUSH previous_interaction_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, interaction_brush));
-    RoundRect(device_context, interaction_button.left, interaction_button.top,
-        interaction_button.right, interaction_button.bottom, 10, 10);
-    SelectObject(device_context, previous_interaction_brush);
-    SelectObject(device_context, previous_interaction_pen);
-    DeleteObject(interaction_brush);
-    DeleteObject(interaction_pen);
-    const wchar_t* interaction_label =
-        interaction_tool == InteractionTool::select ? L"SELECT" :
-        interaction_tool == InteractionTool::spring_drag ? L"SPRING" :
-        L"FORCE";
-    draw_text(device_context, interaction_label, interaction_button,
-        molecule_dragging ? x_axis_color : primary_text_color,
-        button_font, DT_CENTER);
+    wchar_t molecule_count[32]{};
+    std::swprintf(molecule_count, std::size(molecule_count), L"%llu",
+        static_cast<unsigned long long>(simulation_engine.particles().size()));
+    RECT count_area{client_area.right - 104, toolbar.top + 13,
+        client_area.right - 18, toolbar.top + 49};
+    draw_text(device_context, molecule_count, count_area,
+        primary_text_color, status_font, DT_RIGHT);
 
-    const RECT auto_button = auto_config_tool_area(client_area);
-    HPEN auto_pen = CreatePen(PS_SOLID, 1, border_color);
-    HBRUSH auto_brush = CreateSolidBrush(RGB(20, 27, 39));
-    HPEN previous_auto_pen =
-        static_cast<HPEN>(SelectObject(device_context, auto_pen));
-    HBRUSH previous_auto_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, auto_brush));
-    RoundRect(device_context, auto_button.left, auto_button.top,
-        auto_button.right, auto_button.bottom, 10, 10);
-    SelectObject(device_context, previous_auto_brush);
-    SelectObject(device_context, previous_auto_pen);
-    DeleteObject(auto_brush);
-    DeleteObject(auto_pen);
-    draw_text(device_context, L"AUTO", auto_button, primary_text_color,
-        button_font, DT_CENTER);
-
-    const RECT restart_button = restart_tool_area(client_area);
-    HPEN restart_pen = CreatePen(PS_SOLID, 1, border_color);
-    HBRUSH restart_brush = CreateSolidBrush(RGB(20, 27, 39));
-    HPEN previous_restart_pen =
-        static_cast<HPEN>(SelectObject(device_context, restart_pen));
-    HBRUSH previous_restart_brush =
-        static_cast<HBRUSH>(SelectObject(device_context, restart_brush));
-    RoundRect(device_context, restart_button.left, restart_button.top,
-        restart_button.right, restart_button.bottom, 10, 10);
-    SelectObject(device_context, previous_restart_brush);
-    SelectObject(device_context, previous_restart_pen);
-    DeleteObject(restart_brush);
-    DeleteObject(restart_pen);
-    draw_text(device_context, L"RESTART", restart_button,
-        primary_text_color, small_font, DT_CENTER);
-
-    draw_text(device_context, L"X", RECT{654, toolbar.top + 16, 670, toolbar.top + 46},
-        x_axis_color, status_font, DT_CENTER);
-    draw_text(device_context, L"Y", RECT{678, toolbar.top + 16, 694, toolbar.top + 46},
-        y_axis_color, status_font, DT_CENTER);
-    draw_text(device_context, L"Z", RECT{702, toolbar.top + 16, 718, toolbar.top + 46},
-        z_axis_color, status_font, DT_CENTER);
-
-    if (scene_width(client_area) > 1380)
+    const RECT hoverable[]{
+        molecule_button, simulation_button, graphics_button};
+    const wchar_t* tooltips[]{
+        L"Создать молекулу", L"Запустить или остановить симуляцию",
+        L"Настройки и оформление"};
+    for (std::size_t index = 0; index < std::size(hoverable); ++index)
     {
-        wchar_t camera_label[48]{};
-        std::swprintf(camera_label,
-            sizeof(camera_label) / sizeof(camera_label[0]),
-            L"CAMERA %.1f u", camera_state.distance);
-        RECT camera_area{client_area.right - 330, toolbar.top + 16,
-            client_area.right - 220, toolbar.top + 46};
-        draw_text(device_context, camera_label, camera_area, muted_text_color,
-            small_font, DT_RIGHT);
-
-        wchar_t molecule_count[32]{};
-        std::swprintf(molecule_count,
-            sizeof(molecule_count) / sizeof(molecule_count[0]),
-            L"%llu",             static_cast<unsigned long long>(
-                simulation_engine.particles().size()));
-        RECT count_area{client_area.right - 196, toolbar.top + 16,
-            client_area.right - 164, toolbar.top + 46};
-        draw_text(device_context, molecule_count, count_area,
-            primary_text_color, status_font, DT_RIGHT);
+        if (PtInRect(&hoverable[index], workspace_pointer_position))
+        {
+            RECT tooltip{hoverable[index].left - 10,
+                hoverable[index].bottom + 2,
+                hoverable[index].right + 118,
+                hoverable[index].bottom + 24};
+            fill_rectangle(device_context, tooltip, surface_color);
+            draw_text(device_context, tooltips[index], tooltip,
+                muted_text_color, small_font);
+        }
     }
-    draw_filled_circle(device_context, client_area.right - 42,
-        brand_center_y, 5, RGB(22, 53, 64), x_axis_color);
-    draw_line(device_context, client_area.right - 25, toolbar.top + 24,
-        client_area.right - 13, toolbar.top + 36, muted_text_color);
-    draw_line(device_context, client_area.right - 13, toolbar.top + 24,
-        client_area.right - 25, toolbar.top + 36, muted_text_color);
 }
 
 void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
@@ -1664,7 +1896,7 @@ void draw_toolbar_overlay(HDC device_context, const RECT& client_area)
         button_font != nullptr && status_font != nullptr)
     {
         draw_toolbar(device_context, client_area, title_font, small_font,
-            button_font, status_font);
+            status_font);
     }
 }
 
@@ -1684,13 +1916,22 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
     }
     const RECT panel = tools_panel_area(client_area);
     fill_rectangle(device_context, panel, toolbar_color);
-    draw_line(device_context, panel.left, panel.top,
-        panel.left, panel.bottom, border_color);
+    draw_line(device_context, panel.right - 1, panel.top,
+        panel.right - 1, panel.bottom, border_color);
     draw_line(device_context, panel.left, panel.top + 38,
         panel.right, panel.top + 38, border_color);
-    draw_text(device_context, L"TOOLS",
+    draw_text(device_context,
+        workspace_page == WorkspacePage::closed
+            ? L"TOOLS" : workspace_page_title(workspace_page),
         RECT{panel.left + 16, panel.top + 10, panel.right - 48, panel.top + 30},
         primary_text_color, button_font);
+    if (workspace_page != WorkspacePage::closed)
+    {
+        draw_text(device_context, workspace_page_hint(workspace_page),
+            RECT{panel.left + 16, panel.top + 27,
+                panel.right - 40, panel.top + 38},
+            muted_text_color, small_font);
+    }
     draw_line(device_context, panel.right - 25, panel.top + 13,
         panel.right - 13, panel.top + 25, muted_text_color);
     draw_line(device_context, panel.right - 13, panel.top + 13,
@@ -1699,7 +1940,7 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
     const auto draw_tool_button = [device_context](const RECT& area,
                                       const wchar_t* label, bool active) {
         fill_rectangle(device_context, area,
-            active ? RGB(26, 55, 61) : RGB(20, 27, 39));
+            active ? active_surface_color : surface_color);
         draw_line(device_context, area.left, area.top,
             area.right, area.top, border_color);
         draw_line(device_context, area.left, area.bottom - 1,
@@ -1713,6 +1954,172 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
             active ? x_axis_color : primary_text_color,
             small_font, DT_CENTER);
     };
+    const wchar_t* style_names[]{
+        L"ГЛУБОКИЙ КОСМОС", L"АРКТИКА", L"ЛЕС", L"ЯНТАРЬ", L"ОРХИДЕЯ"};
+    if (workspace_page == WorkspacePage::thermodynamics)
+    {
+        const auto& metrics = simulation_engine.metrics();
+        wchar_t values[7][32]{};
+        std::swprintf(values[0], std::size(values[0]), L"%llu",
+            static_cast<unsigned long long>(
+                simulation_engine.particles().size()));
+        std::swprintf(values[1], std::size(values[1]), L"%.4f",
+            metrics.temperature);
+        std::swprintf(values[2], std::size(values[2]), L"%.4f",
+            metrics.kinetic_energy);
+        std::swprintf(values[3], std::size(values[3]), L"%.4f",
+            metrics.potential_energy);
+        std::swprintf(values[4], std::size(values[4]), L"%.4f",
+            metrics.total_energy);
+        std::swprintf(values[5], std::size(values[5]), L"%.4f",
+            metrics.pressure);
+        std::swprintf(values[6], std::size(values[6]), L"%.4f",
+            metrics.number_density);
+        const wchar_t* labels[]{
+            L"МОЛЕКУЛЫ", L"ТЕМПЕРАТУРА", L"КИНЕТИЧЕСКАЯ ЭНЕРГИЯ",
+            L"ПОТЕНЦИАЛЬНАЯ ЭНЕРГИЯ", L"ПОЛНАЯ ЭНЕРГИЯ",
+            L"ДАВЛЕНИЕ", L"ПЛОТНОСТЬ"};
+        for (int index = 0; index < 7; ++index)
+        {
+            const int top = panel.top + 52 + index * 48;
+            draw_text(device_context, labels[index],
+                RECT{panel.left + 14, top, panel.right - 14, top + 16},
+                muted_text_color, small_font);
+            draw_text(device_context,
+                index >= 5 && !metrics.pressure_available
+                    ? L"—" : values[index],
+                RECT{panel.left + 14, top + 15,
+                    panel.right - 14, top + 39},
+                index == 1 ? x_axis_color : primary_text_color,
+                status_font);
+            if (index < 6)
+            {
+                draw_line(device_context, panel.left + 12, top + 44,
+                    panel.right - 12, top + 44, border_color);
+            }
+        }
+        return;
+    }
+    if (workspace_page == WorkspacePage::quantum)
+    {
+        draw_icon(device_context,
+            RECT{panel.left + 75, panel.top + 78,
+                panel.right - 75, panel.top + 128}, 3, x_axis_color);
+        draw_text(device_context, L"КВАНТОВЫЙ РЕЖИМ",
+            RECT{panel.left + 12, panel.top + 146,
+                panel.right - 12, panel.top + 170},
+            primary_text_color, button_font, DT_CENTER);
+        draw_text(device_context, L"Раздел подготовлен для будущих "
+                L"инструментов. Классическая симуляция доступна в панели "
+                L"Динамика.",
+            RECT{panel.left + 16, panel.top + 184,
+                panel.right - 16, panel.top + 254},
+            muted_text_color, small_font, DT_CENTER | DT_WORDBREAK);
+        return;
+    }
+    if (workspace_page == WorkspacePage::dynamics)
+    {
+        const wchar_t* labels[]{
+            L"ИНСТРУМЕНТ ВЗАИМОДЕЙСТВИЯ",
+            L"ТЕРМОСТАТ", L"ИНТЕГРАТОР",
+            L"КУЛОНОВСКИЙ РЕШАТЕЛЬ",
+            L"ГРАНИЦЫ", L"ГРАВИТАЦИЯ",
+            L"ГРАФИКИ И ЗАПИСЬ"};
+        const wchar_t* values[]{
+            interaction_tool == InteractionTool::select
+                ? L"ВЫБОР"
+                : interaction_tool == InteractionTool::spring_drag
+                ? L"ПРУЖИНА" : L"СИЛА",
+            simulation_engine.config().thermostat == simulation::Thermostat::none
+                ? L"ВЫКЛ" : L"ВКЛ",
+            simulation_engine.config().integrator ==
+                    simulation::Integrator::velocity_verlet
+                ? L"VELOCITY VERLET" : L"KICK-DRIFT-KICK",
+            simulation_engine.config().coulomb_solver ==
+                    simulation::CoulombSolver::barnes_hut
+                ? L"BARNES-HUT" : L"ПРЯМОЙ",
+            simulation_engine.config().boundary_mode ==
+                    simulation::BoundaryMode::none
+                ? L"ВЫКЛ" : L"ВКЛ",
+            simulation_engine.config().gravity_z == 0.0
+                ? L"ВЫКЛ" : L"ВКЛ",
+            L"ОТКРЫТЬ"};
+        for (int index = 0; index < 7; ++index)
+        {
+            const RECT button = tools_panel_button_area(client_area, index);
+            draw_tool_button(button, labels[index], false);
+            draw_text(device_context, values[index],
+                RECT{button.left + 8, button.top + 13,
+                    button.right - 8, button.bottom},
+                x_axis_color, small_font, DT_RIGHT);
+        }
+        wchar_t speed_label[32]{};
+        std::swprintf(speed_label, std::size(speed_label),
+            L"Скорость времени: %.2fx", time_flow_factor);
+        draw_text(device_context, speed_label,
+            RECT{panel.left + 14, panel.top + 342,
+                panel.right - 14, panel.top + 368},
+            muted_text_color, small_font);
+        return;
+    }
+    if (workspace_page == WorkspacePage::settings)
+    {
+        for (int index = 0; index < 5; ++index)
+        {
+            draw_tool_button(tools_panel_button_area(client_area, index),
+                style_names[index],
+                static_cast<int>(visual_style) == index);
+        }
+        const wchar_t* settings_labels[]{
+            L"КАЧЕСТВО ГРАФИКИ", L"СЕТКА",
+            L"ОКНО ГРАФИКОВ", L"ДОП. НАСТРОЙКИ",
+            L"АВТОНАСТРОЙКА ПК", L"ПЕРЕЗАПУСК"};
+        for (int index = 0; index < 6; ++index)
+        {
+            draw_tool_button(tools_panel_button_area(client_area, index + 5),
+                settings_labels[index], false);
+        }
+        return;
+    }
+    if (workspace_page == WorkspacePage::experiments)
+    {
+        const wchar_t* labels[]{
+            L"ТАБЛИЦА ЭЛЕМЕНТОВ",
+            L"НАЗНАЧИТЬ ЭЛЕМЕНТ ГРУППЕ",
+            L"ПАРАМЕТРЫ ГРУППЫ",
+            L"ТЕПЛОВОЙ ИМПУЛЬС",
+            L"СБРОСИТЬ СКОРОСТИ",
+            L"СМЕНИТЬ ЗНАК ЗАРЯДА",
+            L"ОБРАЗЕЦ ГАЗА · 64",
+            L"ИОННАЯ ПАРА"};
+        const elements::Element* element =
+            elements::find(selected_element_number);
+        for (int index = 0; index < 8; ++index)
+        {
+            const RECT button = tools_panel_button_area(client_area, index);
+            draw_tool_button(button, labels[index], false);
+        }
+        if (element != nullptr)
+        {
+            wchar_t element_label[96]{};
+            std::swprintf(element_label, std::size(element_label),
+                L"АКТИВНЫЙ ЭЛЕМЕНТ: %s · Z=%d",
+                element->symbol, element->atomic_number);
+            draw_text(device_context, element_label,
+                RECT{panel.left + 12, panel.top + 352,
+                    panel.right - 12, panel.top + 374},
+                element_color(element->atomic_number), small_font);
+            wchar_t model_label[96]{};
+            std::swprintf(model_label, std::size(model_label),
+                L"Масса %.3g а.е.м. · радиус %.0f пм",
+                element->atomic_mass, element->covalent_radius_pm);
+            draw_text(device_context, model_label,
+                RECT{panel.left + 12, panel.top + 376,
+                    panel.right - 12, panel.top + 398},
+                muted_text_color, small_font);
+        }
+        return;
+    }
     bool has_tool_selection = false;
     bool selection_is_frozen = true;
     const auto& particles = simulation_engine.particles();
@@ -1739,12 +2146,27 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
             }
         }
     }
+    const elements::Element* create_element =
+        elements::find(selected_element_number);
+    wchar_t create_molecule_label[64]{};
+    std::swprintf(create_molecule_label, std::size(create_molecule_label),
+        L"СОЗДАТЬ АТОМ: %s",
+        create_element == nullptr ? L"?" : create_element->symbol);
     draw_tool_button(tools_panel_button_area(client_area, 0),
+        molecule_tool_active ? L"ОТМЕНИТЬ РАЗМЕЩЕНИЕ"
+                             : create_molecule_label,
+        molecule_tool_active);
+    draw_tool_button(tools_panel_button_area(client_area, 1),
+        bond_tool_active ? L"СОЗДАНИЕ СВЯЗИ: ВКЛ" : L"СОЗДАТЬ СВЯЗЬ",
+        bond_tool_active);
+    draw_tool_button(tools_panel_button_area(client_area, 2),
+        L"ВЫБОР / ПРУЖИНА / СИЛА", molecule_dragging);
+    draw_tool_button(tools_panel_button_area(client_area, 3),
         has_tool_selection && selection_is_frozen
             ? L"РАЗМОРОЗИТЬ ВЫБРАННЫЕ"
             : L"ЗАМОРОЗИТЬ ВЫБРАННЫЕ",
         has_tool_selection && selection_is_frozen);
-    draw_tool_button(tools_panel_button_area(client_area, 1),
+    draw_tool_button(tools_panel_button_area(client_area, 4),
         molecular_tool == MolecularTool::multi_select
             ? L"ВЫБОР ГРУППЫ: ВКЛ" : L"ВЫБОР НЕСКОЛЬКИХ",
         molecular_tool == MolecularTool::multi_select);
@@ -1753,27 +2175,37 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
         sizeof(lattice_label) / sizeof(lattice_label[0]),
         L"КВАДРАТНАЯ РЕШЁТКА (%llu)",
         static_cast<unsigned long long>(square_lattice_count));
-    draw_tool_button(tools_panel_button_area(client_area, 2),
+    draw_tool_button(tools_panel_button_area(client_area, 5),
         lattice_label, molecular_tool == MolecularTool::square_lattice);
-    draw_tool_button(tools_panel_button_area(client_area, 3),
+    draw_tool_button(tools_panel_button_area(client_area, 6),
         L"СЦЕНАРИЙ: ДОБАВИТЬ ШАГ", false);
-    draw_tool_button(tools_panel_button_area(client_area, 4),
+    draw_tool_button(tools_panel_button_area(client_area, 7),
         scenario_running ? L"ОСТАНОВИТЬ СЦЕНАРИЙ" :
             L"ЗАПУСТИТЬ СЦЕНАРИЙ",
         scenario_running);
-    draw_tool_button(tools_panel_button_area(client_area, 5),
+    draw_tool_button(tools_panel_button_area(client_area, 8),
         L"ОЧИСТИТЬ СЦЕНАРИЙ", false);
-    draw_tool_button(tools_panel_button_area(client_area, 6),
+    draw_tool_button(tools_panel_button_area(client_area, 9),
         wall_tool_active
             ? L"СТЕНА: ПРОТЯНИТЕ"
             : simulation_engine.config().two_dimensional
             ? L"СТЕНА: ЛИНИЯ 2D" : L"СТЕНА: ПЛОСКОСТЬ 3D",
         wall_tool_active);
-    draw_tool_button(tools_panel_button_area(client_area, 7),
+    draw_tool_button(tools_panel_button_area(client_area, 10),
         simulation_engine.config().two_dimensional
             ? L"РАЗМЕРНОСТЬ: 2D → 3D"
             : L"РАЗМЕРНОСТЬ: 3D → 2D",
         simulation_engine.config().two_dimensional);
+    const elements::Element* active_element =
+        elements::find(selected_element_number);
+    if (active_element != nullptr)
+    {
+        wchar_t element_button[64]{};
+        std::swprintf(element_button, std::size(element_button),
+            L"ТАБЛИЦА ЭЛЕМЕНТОВ · %s", active_element->symbol);
+        draw_tool_button(tools_panel_button_area(client_area, 11),
+            element_button, false);
+    }
 
     wchar_t selection_label[48]{};
     std::swprintf(selection_label,
@@ -1782,7 +2214,7 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
         static_cast<unsigned long long>(selected_particles.empty() &&
                 selected_molecule_id != 0 ? 1 : selected_particles.size()));
     draw_text(device_context, selection_label,
-        RECT{panel.left + 12, panel.top + 294,
+        RECT{panel.left + 12, panel.top + 452,
             panel.right - 12, panel.top + 316},
         muted_text_color, small_font);
     if (!scenario_steps.empty())
@@ -1793,7 +2225,7 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
             L"ШАГОВ СЦЕНАРИЯ: %llu",
             static_cast<unsigned long long>(scenario_steps.size()));
         draw_text(device_context, scenario_label,
-            RECT{panel.left + 12, panel.top + 316,
+            RECT{panel.left + 12, panel.top + 474,
                 panel.right - 12, panel.top + 338},
             muted_text_color, small_font);
     }
@@ -1809,6 +2241,10 @@ void draw_overlay(HDC device_context, const RECT& client_area)
     {
         draw_toolbar_overlay(device_context, client_area);
     }
+    if (small_font != nullptr)
+    {
+        draw_workspace_rail(device_context, client_area);
+    }
     if (footer_visible)
     {
         draw_footer_overlay(device_context, client_area);
@@ -1820,6 +2256,7 @@ bool set_window_long_checked(HWND window, int index, LONG_PTR value);
 void set_separate_interface_windows(HWND window, bool enabled);
 void show_detached_settings_window(HWND owner);
 void show_chart_window(HWND owner);
+void show_periodic_table(HWND owner);
 void show_graphics_menu(HWND window, bool force_popup = false);
 
 void toggle_fullscreen(HWND window)
@@ -2568,6 +3005,10 @@ LRESULT CALLBACK detached_interface_procedure(
         RECT client_area{};
         GetClientRect(window, &client_area);
         fill_rectangle(context, client_area, canvas_color);
+        if (small_font != nullptr)
+        {
+            draw_workspace_rail(context, client_area);
+        }
         if (toolbar_visible)
         {
             draw_toolbar_overlay(context, client_area);
@@ -2595,7 +3036,35 @@ LRESULT CALLBACK detached_interface_procedure(
         RECT client_area{};
         GetClientRect(window, &client_area);
         const RECT toolbar = toolbar_area(client_area);
+        const RECT rail{client_area.left,
+            client_area.top + toolbar_height,
+            client_area.left + workspace_rail_width,
+            client_area.bottom};
         const RECT tools = tools_panel_area(client_area);
+        const bool on_rail = PtInRect(&rail, position);
+        if (on_rail)
+        {
+            const WorkspacePage pages[]{
+                WorkspacePage::objects,
+                WorkspacePage::thermodynamics,
+                WorkspacePage::dynamics,
+                WorkspacePage::quantum,
+                WorkspacePage::settings,
+                WorkspacePage::experiments};
+            for (const WorkspacePage page : pages)
+            {
+                const RECT category = workspace_category_area(client_area, page);
+                if (PtInRect(&category, position))
+                {
+                    workspace_page = workspace_page == page
+                        ? WorkspacePage::closed : page;
+                    tools_panel_visible =
+                        workspace_page != WorkspacePage::closed;
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+            }
+        }
         const bool on_toolbar = toolbar_visible &&
             PtInRect(&toolbar, position);
         const bool on_tools = tools_panel_visible &&
@@ -2603,7 +3072,7 @@ LRESULT CALLBACK detached_interface_procedure(
         const RECT footer = footer_area(client_area);
         const bool on_footer = footer_visible &&
             PtInRect(&footer, position);
-        if (!on_toolbar && !on_tools && !on_footer)
+        if (!on_toolbar && !on_rail && !on_tools && !on_footer)
         {
             return 0;
         }
@@ -2705,7 +3174,7 @@ LRESULT CALLBACK detached_settings_procedure(
     if (message == WM_DRAWITEM)
     {
         const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
-        fill_rectangle(item->hDC, item->rcItem, RGB(20, 27, 39));
+        fill_rectangle(item->hDC, item->rcItem, surface_color);
         draw_line(item->hDC, item->rcItem.left, item->rcItem.top,
             item->rcItem.right, item->rcItem.top, border_color);
         draw_line(item->hDC, item->rcItem.left, item->rcItem.bottom - 1,
@@ -3089,22 +3558,26 @@ void show_help(HWND window)
         L"F11  Полноэкранный режим\n"
         L"F2  Показать или скрыть панели\n"
         L"F1  Открыть эту справку\n"
-        L"C  Разместить молекулу\n"
-        L"B  Создать связь между двумя молекулами\n"
+        L"C  Разместить атом выбранного элемента\n"
+        L"B  Создать связь между двумя атомами\n"
         L"Пробел  Запустить или приостановить симуляцию\n"
-        L"[ / ]  Изменить заряд выбранной молекулы\n"
+        L"[ / ]  Изменить заряд выбранного атома\n"
         L"Shift + [ / ]  Изменить целевую температуру\n"
-        L"Esc  Отменить размещение молекулы или создание связи\n"
+        L"Esc  Отменить размещение атома или создание связи\n"
         L"2 / 3  Переключить размерность симуляции\n"
         L"\nИНСТРУМЕНТЫ И НАСТРОЙКИ\n"
         L"SELECT / SPRING / FORCE  Выбор режима взаимодействия\n"
-        L"OPT  Графика, сетка и бюджет оперативной памяти\n"
-        L"OPT → Окно графиков  Запись и сравнение измерений\n"
-        L"AUTO  Автоматический выбор графики для этого ПК\n"
-        L"RESTART  Перезапустить Bonderium\n"
+        L"Левая панель  Объекты, термодинамика, динамика, лаборатория, настройки\n"
+        L"Настройки → Оформление  Выбор одного из пяти стилей\n"
+        L"Динамика  Параметры симуляции и окно графиков\n"
+        L"Лаборатория  Таблица 118 элементов и инструменты опытов\n"
         L"\nИНСТРУМЕНТЫ И СЦЕНАРИИ\n"
-        L"На панели TOOLS включите выбор нескольких и щёлкайте молекулы, "
+        L"В разделе Объекты включите выбор нескольких и щёлкайте молекулы, "
         L"чтобы добавить их в группу или убрать из неё.\n"
+        L"Таблица элементов: поиск по названию, символу или атомному номеру; "
+        L"выбранный элемент используется при создании атомов.\n"
+        L"В Лаборатории можно настроить параметры частиц, задать тепловые "
+        L"скорости, инвертировать заряды и создать образцы газа или ионной пары.\n"
         L"Заморозка переключает выбранные молекулы между неподвижным и "
         L"подвижным состоянием.\n"
         L"Квадратная решётка запрашивает количество молекул; затем протяните "
@@ -3114,7 +3587,9 @@ void show_help(HWND window)
         L"Стена: протяните отрезок в 2D или прямоугольник в 3D; координаты "
         L"стены привязываются к целым значениям.\n"
         L"В 2D молекулы остаются в плоскости XY; переключатель размерности "
-        L"находится на панели TOOLS.\n"
+        L"находится в разделе Объекты.\n"
+        L"Раздел Квантовая динамика пока является заготовкой для будущих "
+        L"инструментов.\n"
         L"Сценарий проигрывается по времени симуляции и хранится до закрытия.\n"
         L"Крестик закрывает панель; клавиша F2 позволяет вернуть её.\n"
         L"Бюджет памяти предупреждает о достижении порога и приостанавливает "
@@ -3557,7 +4032,7 @@ void draw_chart_window(HDC context, const RECT& client_area)
     const auto draw_button = [context](const RECT& area,
                                   const wchar_t* label, bool active) {
         fill_rectangle(context, area,
-            active ? RGB(26, 55, 61) : RGB(20, 27, 39));
+            active ? active_surface_color : surface_color);
         draw_line(context, area.left, area.top, area.right, area.top,
             border_color);
         draw_line(context, area.left, area.bottom - 1,
@@ -3596,14 +4071,13 @@ void draw_chart_window(HDC context, const RECT& client_area)
     {
         return;
     }
-    fill_rectangle(context, plot, RGB(12, 18, 28));
+    fill_rectangle(context, plot, canvas_color);
     constexpr int horizontal_divisions = 5;
     for (int index = 0; index <= horizontal_divisions; ++index)
     {
         const int y = plot.top + (plot.bottom - plot.top) * index /
             horizontal_divisions;
-        draw_line(context, plot.left, y, plot.right, y,
-            RGB(31, 42, 57));
+        draw_line(context, plot.left, y, plot.right, y, border_color);
     }
     draw_line(context, plot.left, plot.top, plot.left, plot.bottom,
         border_color);
@@ -3894,6 +4368,329 @@ LRESULT CALLBACK chart_window_procedure(
     return DefWindowProcW(window, message, w_param, l_param);
 }
 
+RECT element_table_cell_area(const RECT& client, int row, int column)
+{
+    constexpr int cell_width = 48;
+    constexpr int cell_height = 44;
+    constexpr int gap = 4;
+    constexpr int step_x = cell_width + gap;
+    constexpr int step_y = cell_height + 6;
+    const int table_width = 18 * cell_width + 17 * gap;
+    const int left = (static_cast<int>(client.right) - table_width) / 2;
+    const int top = 88;
+    return RECT{left + column * step_x, top + row * step_y,
+        left + column * step_x + cell_width,
+        top + row * step_y + cell_height};
+}
+
+bool element_matches_search(const elements::Element& element,
+    const wchar_t* search_text)
+{
+    if (search_text == nullptr || search_text[0] == L'\0')
+    {
+        return true;
+    }
+    std::wstring query(search_text);
+    std::wstring name(element.name);
+    std::wstring symbol(element.symbol);
+    CharLowerBuffW(&query[0], static_cast<DWORD>(query.size()));
+    CharLowerBuffW(&name[0], static_cast<DWORD>(name.size()));
+    CharLowerBuffW(&symbol[0], static_cast<DWORD>(symbol.size()));
+    wchar_t number[8]{};
+    std::swprintf(number, std::size(number), L"%d", element.atomic_number);
+    return name.find(query) != std::wstring::npos ||
+        symbol.find(query) != std::wstring::npos ||
+        query == number;
+}
+
+void accept_periodic_table_selection(HWND window)
+{
+    selected_element_number = highlighted_element_number;
+    if (element_table_window == window)
+    {
+        DestroyWindow(window);
+    }
+    if (main_window != nullptr)
+    {
+        InvalidateRect(main_window, nullptr, FALSE);
+    }
+    if (detached_interface_window != nullptr)
+    {
+        InvalidateRect(detached_interface_window, nullptr, FALSE);
+    }
+}
+
+LRESULT CALLBACK element_table_window_procedure(
+    HWND window, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    if (message == WM_ERASEBKGND)
+    {
+        return 1;
+    }
+    if (message == WM_CREATE)
+    {
+        element_search_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            24, 18, 320, 28, window, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        if (element_search_edit == nullptr)
+        {
+            MessageBoxW(window, L"Не удалось создать поле поиска элементов.",
+                L"Таблица элементов", MB_OK | MB_ICONERROR);
+            return -1;
+        }
+        element_search_background = CreateSolidBrush(surface_color);
+        if (element_search_background == nullptr)
+        {
+            DestroyWindow(element_search_edit);
+            element_search_edit = nullptr;
+            MessageBoxW(window, L"Не удалось оформить поле поиска элементов.",
+                L"Таблица элементов", MB_OK | MB_ICONERROR);
+            return -1;
+        }
+        SendMessageW(element_search_edit, WM_SETFONT,
+            reinterpret_cast<WPARAM>(small_font), TRUE);
+        return 0;
+    }
+    if (message == WM_CTLCOLOREDIT)
+    {
+        SetTextColor(reinterpret_cast<HDC>(w_param), primary_text_color);
+        SetBkColor(reinterpret_cast<HDC>(w_param), surface_color);
+        return reinterpret_cast<LRESULT>(element_search_background);
+    }
+    if (message == WM_SIZE)
+    {
+        if (element_search_edit != nullptr)
+        {
+            SetWindowPos(element_search_edit, nullptr, 24, 18, 320, 28,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_GETMINMAXINFO)
+    {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
+        limits->ptMinTrackSize.x = 1000;
+        limits->ptMinTrackSize.y = 730;
+        return 0;
+    }
+    if (message == WM_COMMAND && HIWORD(w_param) == EN_CHANGE)
+    {
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_LBUTTONDBLCLK || message == WM_LBUTTONDOWN)
+    {
+        const POINT point{
+            static_cast<short>(LOWORD(l_param)),
+            static_cast<short>(HIWORD(l_param))};
+        RECT client{};
+        GetClientRect(window, &client);
+        const RECT use_button{client.right - 190, client.bottom - 58,
+            client.right - 24, client.bottom - 18};
+        if (PtInRect(&use_button, point))
+        {
+            accept_periodic_table_selection(window);
+            return 0;
+        }
+        wchar_t query[64]{};
+        if (element_search_edit != nullptr)
+        {
+            GetWindowTextW(element_search_edit, query,
+                static_cast<int>(std::size(query)));
+        }
+        for (const elements::Element& element : elements::all())
+        {
+            if (!element_matches_search(element, query))
+            {
+                continue;
+            }
+            const elements::Position grid =
+                elements::table_position(element.atomic_number);
+            const RECT cell = element_table_cell_area(
+                client, grid.row, grid.column);
+            if (PtInRect(&cell, point))
+            {
+                highlighted_element_number = element.atomic_number;
+                if (message == WM_LBUTTONDBLCLK)
+                {
+                    accept_periodic_table_selection(window);
+                }
+                else
+                {
+                    InvalidateRect(window, nullptr, FALSE);
+                }
+                return 0;
+            }
+        }
+        return 0;
+    }
+    if (message == WM_PAINT)
+    {
+        PAINTSTRUCT paint{};
+        HDC context = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        fill_rectangle(context, client, canvas_color);
+        wchar_t query[64]{};
+        if (element_search_edit != nullptr)
+        {
+            GetWindowTextW(element_search_edit, query,
+                static_cast<int>(std::size(query)));
+        }
+        draw_text(context, L"118 ЭЛЕМЕНТОВ · ПОИСК ПО НАЗВАНИЮ, СИМВОЛУ И НОМЕРУ",
+            RECT{360, 18, client.right - 24, 46},
+            muted_text_color, small_font);
+        draw_text(context, L"ПЕРИОДИЧЕСКАЯ ТАБЛИЦА",
+            RECT{24, 54, client.right - 24, 78},
+            primary_text_color, button_font);
+        for (const elements::Element& element : elements::all())
+        {
+            if (!element_matches_search(element, query))
+            {
+                continue;
+            }
+            const elements::Position grid =
+                elements::table_position(element.atomic_number);
+            const RECT cell = element_table_cell_area(
+                client, grid.row, grid.column);
+            const bool active =
+                highlighted_element_number == element.atomic_number;
+            fill_rectangle(context, cell,
+                active ? active_surface_color : surface_color);
+            draw_line(context, cell.left, cell.top, cell.right, cell.top,
+                active ? x_axis_color : border_color, active ? 2 : 1);
+            draw_line(context, cell.left, cell.bottom - 1,
+                cell.right, cell.bottom - 1, border_color);
+            draw_line(context, cell.left, cell.top, cell.left,
+                cell.bottom, border_color);
+            draw_line(context, cell.right - 1, cell.top,
+                cell.right - 1, cell.bottom, border_color);
+            const COLORREF color = element_color(element.atomic_number);
+            wchar_t number[8]{};
+            std::swprintf(number, std::size(number), L"%d",
+                element.atomic_number);
+            draw_text(context, number,
+                RECT{cell.left + 3, cell.top + 2,
+                    cell.right - 3, cell.top + 13},
+                muted_text_color, small_font);
+            draw_text(context, element.symbol,
+                RECT{cell.left + 2, cell.top + 13,
+                    cell.right - 2, cell.bottom - 2},
+                color, button_font, DT_CENTER);
+        }
+
+        const elements::Element* selected =
+            elements::find(highlighted_element_number);
+        if (selected != nullptr)
+        {
+            const int detail_top = 568;
+            fill_rectangle(context,
+                RECT{24, detail_top, client.right - 24,
+                    client.bottom - 70}, toolbar_color);
+            draw_text(context, selected->symbol,
+                RECT{40, detail_top + 10, 112, detail_top + 70},
+                element_color(selected->atomic_number), title_font, DT_CENTER);
+            wchar_t title[128]{};
+            std::swprintf(title, std::size(title), L"%d · %s",
+                selected->atomic_number, selected->name);
+            draw_text(context, title,
+                RECT{132, detail_top + 8, client.right - 210, detail_top + 32},
+                primary_text_color, button_font);
+            wchar_t properties[192]{};
+            std::swprintf(properties, std::size(properties),
+                L"Масса: %.5g а.е.м.     Ковалентный радиус: %.0f пм     %s",
+                selected->atomic_mass, selected->covalent_radius_pm,
+                elements::category_name(selected->category));
+            draw_text(context, properties,
+                RECT{132, detail_top + 36, client.right - 210,
+                    detail_top + 64},
+                muted_text_color, small_font);
+        }
+        const RECT use_button{client.right - 190, client.bottom - 58,
+            client.right - 24, client.bottom - 18};
+        fill_rectangle(context, use_button, active_surface_color);
+        draw_text(context, L"ИСПОЛЬЗОВАТЬ",
+            RECT{use_button.left, use_button.top,
+                use_button.right, use_button.bottom},
+            x_axis_color, button_font, DT_CENTER);
+        draw_text(context,
+            L"Классическая модель: параметры взаимодействия приближённые",
+            RECT{24, client.bottom - 56, client.right - 210,
+                client.bottom - 20},
+            muted_text_color, small_font);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    if (message == WM_CLOSE)
+    {
+        DestroyWindow(window);
+        return 0;
+    }
+    if (message == WM_DESTROY)
+    {
+        if (element_table_window == window)
+        {
+            element_table_window = nullptr;
+            element_search_edit = nullptr;
+            if (element_search_background != nullptr)
+            {
+                DeleteObject(element_search_background);
+                element_search_background = nullptr;
+            }
+        }
+        return 0;
+    }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
+
+void show_periodic_table(HWND owner)
+{
+    if (element_table_window != nullptr)
+    {
+        ShowWindow(element_table_window, SW_SHOW);
+        SetForegroundWindow(element_table_window);
+        return;
+    }
+    static bool class_registered = false;
+    if (!class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.style = CS_DBLCLKS;
+        window_class.lpfnWndProc = element_table_window_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor =
+            LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground = nullptr;
+        window_class.lpszClassName = element_table_window_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(owner, L"Не удалось зарегистрировать таблицу элементов.",
+                L"Таблица элементов", MB_OK | MB_ICONERROR);
+            return;
+        }
+        class_registered = true;
+    }
+    highlighted_element_number = selected_element_number;
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    element_table_window = CreateWindowExW(WS_EX_TOOLWINDOW,
+        element_table_window_class_name, L"Bonderium — периодическая таблица",
+        WS_OVERLAPPEDWINDOW, owner_rect.left + 40, owner_rect.top + 40,
+        1120, 790, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (element_table_window == nullptr)
+    {
+        MessageBoxW(owner, L"Не удалось открыть таблицу элементов.",
+            L"Таблица элементов", MB_OK | MB_ICONERROR);
+        return;
+    }
+    ShowWindow(element_table_window, SW_SHOW);
+    UpdateWindow(element_table_window);
+}
+
 void show_chart_window(HWND owner)
 {
     if (chart_window != nullptr)
@@ -4026,6 +4823,382 @@ bool parse_input_number(const wchar_t* text, double& value)
     return end != text && *end == L'\0' && std::isfinite(value);
 }
 
+std::vector<std::size_t> experiment_targets()
+{
+    std::vector<std::size_t> targets = current_selection();
+    if (!targets.empty())
+    {
+        return targets;
+    }
+    targets.resize(simulation_engine.particles().size());
+    for (std::size_t index = 0; index < targets.size(); ++index)
+    {
+        targets[index] = index;
+    }
+    return targets;
+}
+
+bool initialize_thermal_velocities(
+    const std::vector<std::size_t>& targets, double temperature)
+{
+    std::vector<std::size_t> movable;
+    for (const std::size_t index : targets)
+    {
+        if (index < simulation_engine.particles().size() &&
+            !simulation_engine.particles()[index].fixed)
+        {
+            movable.push_back(index);
+        }
+    }
+    if (movable.empty())
+    {
+        return false;
+    }
+    if (temperature == 0.0)
+    {
+        for (const std::size_t index : movable)
+        {
+            simulation_engine.set_velocity(index, {});
+        }
+        return true;
+    }
+
+    static std::mt19937_64 generator(
+        static_cast<std::uint64_t>(GetTickCount64()) ^
+        static_cast<std::uint64_t>(GetCurrentProcessId()));
+    Vec3 momentum{};
+    double total_mass = 0.0;
+    for (const std::size_t index : movable)
+    {
+        const simulation::Particle& particle =
+            simulation_engine.particles()[index];
+        const double standard_deviation =
+            std::sqrt(temperature / particle.mass);
+        std::normal_distribution<double> distribution(
+            0.0, standard_deviation);
+        const Vec3 velocity{
+            distribution(generator), distribution(generator),
+            simulation_engine.config().two_dimensional
+                ? 0.0 : distribution(generator)};
+        if (!simulation_engine.set_velocity(index, velocity))
+        {
+            return false;
+        }
+        momentum = momentum + velocity * particle.mass;
+        total_mass += particle.mass;
+    }
+    if (movable.size() > 1 && total_mass > 0.0)
+    {
+        const Vec3 center_velocity = momentum * (1.0 / total_mass);
+        for (const std::size_t index : movable)
+        {
+            const Vec3 velocity =
+                simulation_engine.particles()[index].velocity -
+                center_velocity;
+            if (!simulation_engine.set_velocity(index, velocity))
+            {
+                return false;
+            }
+        }
+    }
+
+    double kinetic_energy = 0.0;
+    for (const std::size_t index : movable)
+    {
+        const simulation::Particle& particle =
+            simulation_engine.particles()[index];
+        kinetic_energy += 0.5 * particle.mass *
+            dot(particle.velocity, particle.velocity);
+    }
+    const int dimensions =
+        simulation_engine.config().two_dimensional ? 2 : 3;
+    const std::size_t degrees_of_freedom =
+        static_cast<std::size_t>(dimensions) * movable.size();
+    if (kinetic_energy <= 0.0 || degrees_of_freedom == 0)
+    {
+        return false;
+    }
+    const double scale = std::sqrt(
+        temperature * static_cast<double>(degrees_of_freedom) /
+        (2.0 * kinetic_energy));
+    for (const std::size_t index : movable)
+    {
+        const Vec3 velocity =
+            simulation_engine.particles()[index].velocity * scale;
+        if (!simulation_engine.set_velocity(index, velocity))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void apply_selected_element_to_particles(HWND window)
+{
+    const std::vector<std::size_t> selection = current_selection();
+    if (selection.empty())
+    {
+        MessageBoxW(window, L"Сначала выберите одну или несколько частиц.",
+            L"Элемент", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    for (const std::size_t index : selection)
+    {
+        const simulation::Particle particle =
+            simulation_engine.particles()[index];
+        if (!configure_particle_element(index, selected_element_number,
+                particle.charge, particle.fixed))
+        {
+            MessageBoxW(window, L"Не удалось назначить элемент частице.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void edit_selected_particle_parameters(HWND window)
+{
+    const std::vector<std::size_t> selection = current_selection();
+    if (selection.empty())
+    {
+        MessageBoxW(window, L"Сначала выберите одну или несколько частиц.",
+            L"Параметры частицы", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const simulation::Particle& first =
+        simulation_engine.particles()[selection.front()];
+    InputDialogState dialog;
+    dialog.title = L"Параметры выбранных частиц";
+    dialog.field_count = 4;
+    dialog.labels[0] = L"Масса модели (0,001–10000):";
+    dialog.labels[1] = L"Заряд (-100…100):";
+    dialog.labels[2] = L"Параметр sigma (0,01–100):";
+    dialog.labels[3] = L"Параметр epsilon (0–100):";
+    std::swprintf(dialog.values[0], std::size(dialog.values[0]), L"%.6g",
+        first.mass);
+    std::swprintf(dialog.values[1], std::size(dialog.values[1]), L"%.6g",
+        first.charge);
+    std::swprintf(dialog.values[2], std::size(dialog.values[2]), L"%.6g",
+        first.sigma);
+    std::swprintf(dialog.values[3], std::size(dialog.values[3]), L"%.6g",
+        first.epsilon);
+    if (!show_input_dialog(window, dialog))
+    {
+        return;
+    }
+    double mass = 0.0;
+    double charge = 0.0;
+    double sigma = 0.0;
+    double epsilon = 0.0;
+    if (!parse_input_number(dialog.values[0], mass) ||
+        mass < 0.001 || mass > 10000.0 ||
+        !parse_input_number(dialog.values[1], charge) ||
+        std::abs(charge) > 100.0 ||
+        !parse_input_number(dialog.values[2], sigma) ||
+        sigma < 0.01 || sigma > 100.0 ||
+        !parse_input_number(dialog.values[3], epsilon) ||
+        epsilon < 0.0 || epsilon > 100.0)
+    {
+        MessageBoxW(window, L"Проверьте диапазоны параметров модели.",
+            L"Некорректные параметры", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    for (const std::size_t index : selection)
+    {
+        const simulation::Particle particle =
+            simulation_engine.particles()[index];
+        if (!simulation_engine.set_particle_properties(index, mass, charge,
+                sigma, epsilon, particle.fixed))
+        {
+            MessageBoxW(window, L"Не удалось обновить параметры частицы.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    simulation_engine.invalidate_forces();
+    invalidate_simulation_ui(window, true);
+}
+
+void thermalize_experiment_particles(HWND window)
+{
+    const std::vector<std::size_t> targets = experiment_targets();
+    if (targets.empty())
+    {
+        MessageBoxW(window, L"В сцене пока нет частиц.",
+            L"Тепловой импульс", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    InputDialogState dialog;
+    dialog.title = L"Тепловая подготовка";
+    dialog.field_count = 1;
+    dialog.labels[0] = L"Целевая температура модели (0–1000000):";
+    std::swprintf(dialog.values[0], std::size(dialog.values[0]), L"1.0");
+    if (!show_input_dialog(window, dialog))
+    {
+        return;
+    }
+    double temperature = 0.0;
+    if (!parse_input_number(dialog.values[0], temperature) ||
+        temperature < 0.0 || temperature > 1000000.0)
+    {
+        MessageBoxW(window, L"Укажите температуру модели от 0 до 1000000.",
+            L"Некорректная температура", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (!initialize_thermal_velocities(targets, temperature))
+    {
+        MessageBoxW(window, L"Не удалось задать скорости. "
+            L"Проверьте, что выбраны подвижные частицы.",
+            L"Тепловая подготовка", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void reset_experiment_velocities(HWND window)
+{
+    const std::vector<std::size_t> targets = experiment_targets();
+    if (targets.empty())
+    {
+        MessageBoxW(window, L"В сцене пока нет частиц.",
+            L"Сброс скоростей", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    for (const std::size_t index : targets)
+    {
+        if (!simulation_engine.set_velocity(index, {}))
+        {
+            MessageBoxW(window, L"Не удалось обнулить скорость частицы.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void invert_experiment_charges(HWND window)
+{
+    const std::vector<std::size_t> selection = current_selection();
+    if (selection.empty())
+    {
+        MessageBoxW(window, L"Выберите частицы, заряд которых нужно изменить.",
+            L"Заряды", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    for (const std::size_t index : selection)
+    {
+        if (!simulation_engine.set_charge(
+                index, -simulation_engine.particles()[index].charge))
+        {
+            MessageBoxW(window, L"Не удалось изменить заряд частицы.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    simulation_engine.invalidate_forces();
+    invalidate_simulation_ui(window, true);
+}
+
+void create_gas_sample(HWND window)
+{
+    constexpr std::size_t particle_count = 64;
+    if (!ram_budget_allows_molecule(window, particle_count))
+    {
+        return;
+    }
+    const elements::Element* element =
+        elements::find(selected_element_number);
+    if (element == nullptr)
+    {
+        MessageBoxW(window, L"Выбранный элемент недоступен.",
+            L"Образец газа", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const double spacing = (std::max)(1.0,
+        element_model_sigma(*element) * 1.5);
+    const int side = simulation_engine.config().two_dimensional ? 8 : 4;
+    const std::size_t first = simulation_engine.particles().size();
+    for (int z = 0; z < (simulation_engine.config().two_dimensional ? 1 : 4);
+         ++z)
+    {
+        for (int y = 0; y < side; ++y)
+        {
+            for (int x = 0; x < side; ++x)
+            {
+                const Vec3 position{
+                    camera_state.target.x +
+                        (x - (side - 1) * 0.5) * spacing,
+                    camera_state.target.y +
+                        (y - (side - 1) * 0.5) * spacing,
+                    simulation_engine.config().two_dimensional ? 0.0 :
+                        camera_state.target.z +
+                            (z - 1.5) * spacing};
+                const std::size_t index =
+                    simulation_engine.add_particle(position);
+                if (!configure_particle_element(index, selected_element_number))
+                {
+                    MessageBoxW(window,
+                        L"Не удалось создать полный образец газа.",
+                        L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+                    return;
+                }
+            }
+        }
+    }
+    selected_particles.clear();
+    for (std::size_t index = first;
+         index < simulation_engine.particles().size(); ++index)
+    {
+        selected_particles.push_back(index);
+    }
+    selected_molecule_id = static_cast<std::uint64_t>(
+        simulation_engine.particles().size());
+    if (!initialize_thermal_velocities(selected_particles, 1.0))
+    {
+        MessageBoxW(window, L"Образец создан, но не удалось задать "
+            L"начальные скорости.",
+            L"Образец газа", MB_OK | MB_ICONWARNING);
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void create_ionic_pair_sample(HWND window)
+{
+    if (!ram_budget_allows_molecule(window, 2))
+    {
+        return;
+    }
+    const elements::Element* element =
+        elements::find(selected_element_number);
+    if (element == nullptr)
+    {
+        MessageBoxW(window, L"Выбранный элемент недоступен.",
+            L"Ионная пара", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const double separation = (std::max)(1.5,
+        element_model_sigma(*element) * 1.5);
+    const double center_z = simulation_engine.config().two_dimensional
+        ? 0.0 : camera_state.target.z;
+    const std::size_t first = simulation_engine.add_particle(Vec3{
+        camera_state.target.x - separation * 0.5,
+        camera_state.target.y, center_z});
+    const std::size_t second = simulation_engine.add_particle(Vec3{
+        camera_state.target.x + separation * 0.5,
+        camera_state.target.y, center_z});
+    if (!configure_particle_element(first, selected_element_number, 1.0) ||
+        !configure_particle_element(second, selected_element_number, -1.0))
+    {
+        MessageBoxW(window, L"Не удалось настроить ионную пару.",
+            L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+        return;
+    }
+    selected_particles = {first, second};
+    selected_molecule_id = static_cast<std::uint64_t>(second + 1);
+    invalidate_simulation_ui(window, true);
+}
+
 void configure_square_lattice(HWND window)
 {
     InputDialogState dialog;
@@ -4151,8 +5324,8 @@ bool create_square_lattice(HWND window, std::size_t count,
             start.z};
         const std::size_t particle_index =
             simulation_engine.add_particle(position);
-        if (!simulation_engine.set_particle_properties(particle_index, 1.0,
-                0.0, molecule_sigma, molecule_epsilon, false))
+        if (!configure_particle_element(
+                particle_index, selected_element_number))
         {
             const std::size_t added =
                 simulation_engine.particles().size() -
@@ -4646,8 +5819,8 @@ void place_molecule(HWND window, POINT position)
     }
     const std::size_t particle_index =
         simulation_engine.add_particle(world_position);
-    if (!simulation_engine.set_particle_properties(particle_index, 1.0, 0.0,
-            molecule_sigma, molecule_epsilon, false))
+    if (!configure_particle_element(
+            particle_index, selected_element_number))
     {
         MessageBoxW(window, L"Unable to initialize molecule physics properties.",
             L"Simulation error", MB_OK | MB_ICONERROR);
@@ -4937,6 +6110,14 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             {
                 draw_tools_panel_overlay(paint_context, client_area);
             }
+            if (rectangles_intersect(paint.rcPaint,
+                    RECT{client_area.left,
+                        client_area.top + toolbar_height,
+                        client_area.left + workspace_rail_width,
+                        client_area.bottom}))
+            {
+                draw_workspace_rail(paint_context, client_area);
+            }
         }
         EndPaint(window, &paint);
         if (scene_rendered)
@@ -5148,10 +6329,29 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         GetClientRect(window, &client_area);
         const RECT area = scene_area(client_area);
         const bool over_scene = PtInRect(&area, position) != FALSE;
-        const bool changed = position.x != pointer_position.x ||
+        const int old_hover = hovered_ui_target(
+            client_area, workspace_pointer_position);
+        const int new_hover = hovered_ui_target(client_area, position);
+        const bool scene_changed = position.x != pointer_position.x ||
             position.y != pointer_position.y || over_scene != pointer_over_scene;
+        workspace_pointer_position = position;
         pointer_position = position;
         pointer_over_scene = over_scene;
+        if (old_hover != new_hover)
+        {
+            const RECT toolbar = toolbar_area(client_area);
+            const RECT rail{client_area.left,
+                client_area.top + toolbar_height,
+                client_area.left + workspace_rail_width,
+                client_area.bottom};
+            InvalidateRect(window, &toolbar, FALSE);
+            InvalidateRect(window, &rail, FALSE);
+            if (tools_panel_visible)
+            {
+                const RECT panel = tools_panel_area(client_area);
+                InvalidateRect(window, &panel, FALSE);
+            }
+        }
 
         if (orbit_dragging)
         {
@@ -5224,7 +6424,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         {
             draw_preview_cursor(window, position);
         }
-        if (changed && molecule_tool_active)
+        if (scene_changed && molecule_tool_active)
         {
             InvalidateRect(window, &area, FALSE);
         }
@@ -5234,11 +6434,19 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     if (message == WM_MOUSELEAVE)
     {
         pointer_over_scene = false;
+        workspace_pointer_position = POINT{-1, -1};
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const RECT toolbar = toolbar_area(client_area);
+        const RECT rail{client_area.left,
+            client_area.top + toolbar_height,
+            client_area.left + workspace_rail_width,
+            client_area.bottom};
+        InvalidateRect(window, &toolbar, FALSE);
+        InvalidateRect(window, &rail, FALSE);
         if (molecule_tool_active)
         {
             SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
-            RECT client_area{};
-            GetClientRect(window, &client_area);
             const RECT area = scene_area(client_area);
             InvalidateRect(window, &area, FALSE);
         }
@@ -5395,6 +6603,32 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             static_cast<short>(HIWORD(l_param))};
         RECT client_area{};
         GetClientRect(window, &client_area);
+        if (!separate_interface_windows)
+        {
+            const WorkspacePage pages[]{
+                WorkspacePage::objects,
+                WorkspacePage::thermodynamics,
+                WorkspacePage::dynamics,
+                WorkspacePage::quantum,
+                WorkspacePage::settings,
+                WorkspacePage::experiments};
+            for (const WorkspacePage page : pages)
+            {
+                const RECT category =
+                    workspace_category_area(client_area, page);
+                if (PtInRect(&category, position))
+                {
+                    workspace_page = workspace_page == page
+                        ? WorkspacePage::closed : page;
+                    tools_panel_visible =
+                        workspace_page != WorkspacePage::closed;
+                    footer_visible = false;
+                    wall_tool_active = false;
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+            }
+        }
         const RECT time_slider = time_flow_slider_area(client_area);
         if (toolbar_visible && PtInRect(&time_slider, position))
         {
@@ -5404,13 +6638,8 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             return 0;
         }
         const RECT button_area = molecule_tool_area(client_area);
-        const RECT help_button = help_tool_area(client_area);
         const RECT simulation_button = simulation_tool_area(client_area);
         const RECT graphics_button = graphics_tool_area(client_area);
-        const RECT interaction_button =
-            interaction_tool_area(client_area);
-        const RECT auto_button = auto_config_tool_area(client_area);
-        const RECT restart_button = restart_tool_area(client_area);
         const RECT tools_panel = tools_panel_area(client_area);
         const RECT tools_close{
             tools_panel.right - 34, tools_panel.top,
@@ -5419,12 +6648,18 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             PtInRect(&tools_close, position))
         {
             tools_panel_visible = false;
+            workspace_page = WorkspacePage::closed;
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
         if (tools_panel_visible)
         {
-            for (int row = 0; row < 8; ++row)
+            const int row_count =
+                workspace_page == WorkspacePage::objects ? 12 :
+                workspace_page == WorkspacePage::settings ? 11 :
+                workspace_page == WorkspacePage::dynamics ? 7 :
+                workspace_page == WorkspacePage::experiments ? 8 : 0;
+            for (int row = 0; row < row_count; ++row)
             {
                 const RECT tool_button =
                     tools_panel_button_area(client_area, row);
@@ -5432,12 +6667,161 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 {
                     continue;
                 }
+                if (workspace_page == WorkspacePage::settings)
+                {
+                    if (row < 5)
+                    {
+                        apply_visual_style(
+                            static_cast<VisualStyle>(row));
+                        InvalidateRect(window, nullptr, FALSE);
+                    }
+                    else if (row == 5)
+                    {
+                        graphics_quality =
+                            graphics_quality == GraphicsQuality::performance
+                            ? GraphicsQuality::balanced
+                            : graphics_quality == GraphicsQuality::balanced
+                            ? GraphicsQuality::quality
+                            : GraphicsQuality::performance;
+                        InvalidateRect(window, nullptr, FALSE);
+                    }
+                    else if (row == 6)
+                    {
+                        grid_visible = !grid_visible;
+                        InvalidateRect(window, nullptr, FALSE);
+                    }
+                    else if (row == 7)
+                    {
+                        show_chart_window(window);
+                    }
+                    else if (row == 8)
+                    {
+                        show_graphics_menu(window, true);
+                    }
+                    else if (row == 9)
+                    {
+                        configure_graphics_for_this_pc(window);
+                    }
+                    else if (row == 10)
+                    {
+                        restart_application(window);
+                    }
+                    return 0;
+                }
+                if (workspace_page == WorkspacePage::dynamics)
+                {
+                    auto& config = simulation_engine.config();
+                    switch (row)
+                    {
+                    case 0:
+                        show_interaction_menu(window);
+                        break;
+                    case 1:
+                        config.thermostat =
+                            config.thermostat == simulation::Thermostat::none
+                            ? simulation::Thermostat::andersen
+                            : config.thermostat == simulation::Thermostat::andersen
+                            ? simulation::Thermostat::berendsen
+                            : config.thermostat ==
+                                simulation::Thermostat::berendsen
+                            ? simulation::Thermostat::acceleration_damping
+                            : simulation::Thermostat::none;
+                        simulation_engine.invalidate_forces();
+                        invalidate_simulation_ui(window, true);
+                        break;
+                    case 2:
+                        config.integrator =
+                            config.integrator ==
+                                simulation::Integrator::velocity_verlet
+                            ? simulation::Integrator::kick_drift_kick
+                            : simulation::Integrator::velocity_verlet;
+                        simulation_engine.invalidate_forces();
+                        invalidate_simulation_ui(window, true);
+                        break;
+                    case 3:
+                        config.coulomb_solver =
+                            config.coulomb_solver ==
+                                simulation::CoulombSolver::barnes_hut
+                            ? simulation::CoulombSolver::direct
+                            : simulation::CoulombSolver::barnes_hut;
+                        simulation_engine.invalidate_forces();
+                        invalidate_simulation_ui(window, true);
+                        break;
+                    case 4:
+                        config.boundary_mode =
+                            config.boundary_mode ==
+                                simulation::BoundaryMode::none
+                            ? simulation::BoundaryMode::reflective
+                            : simulation::BoundaryMode::none;
+                        simulation_engine.invalidate_forces();
+                        invalidate_simulation_ui(window, true);
+                        break;
+                    case 5:
+                        config.gravity_z =
+                            config.gravity_z == 0.0 ? -1.0 : 0.0;
+                        simulation_engine.invalidate_forces();
+                        invalidate_simulation_ui(window, true);
+                        break;
+                    case 6:
+                        show_chart_window(window);
+                        break;
+                    default:
+                        break;
+                    }
+                    return 0;
+                }
+                if (workspace_page == WorkspacePage::experiments)
+                {
+                    switch (row)
+                    {
+                    case 0:
+                        show_periodic_table(window);
+                        break;
+                    case 1:
+                        apply_selected_element_to_particles(window);
+                        break;
+                    case 2:
+                        edit_selected_particle_parameters(window);
+                        break;
+                    case 3:
+                        thermalize_experiment_particles(window);
+                        break;
+                    case 4:
+                        reset_experiment_velocities(window);
+                        break;
+                    case 5:
+                        invert_experiment_charges(window);
+                        break;
+                    case 6:
+                        create_gas_sample(window);
+                        break;
+                    case 7:
+                        create_ionic_pair_sample(window);
+                        break;
+                    default:
+                        break;
+                    }
+                    return 0;
+                }
+                if (workspace_page != WorkspacePage::objects)
+                {
+                    return 0;
+                }
                 switch (row)
                 {
                 case 0:
-                    toggle_selected_particles_fixed(window);
+                    set_molecule_tool(window, !molecule_tool_active);
                     break;
                 case 1:
+                    set_bond_tool(window, !bond_tool_active);
+                    break;
+                case 2:
+                    show_interaction_menu(window);
+                    break;
+                case 3:
+                    toggle_selected_particles_fixed(window);
+                    break;
+                case 4:
                     if (molecular_tool != MolecularTool::multi_select &&
                         selected_particles.empty() &&
                         selected_molecule_id > 0 &&
@@ -5458,19 +6842,19 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                     square_lattice_dragging = false;
                     invalidate_simulation_ui(window, true);
                     break;
-                case 2:
+                case 5:
                     configure_square_lattice(window);
                     break;
-                case 3:
+                case 6:
                     show_scenario_step_menu(window);
                     break;
-                case 4:
+                case 7:
                     toggle_scenario(window);
                     break;
-                case 5:
+                case 8:
                     clear_scenario(window);
                     break;
-                case 6:
+                case 9:
                     wall_tool_active = !wall_tool_active;
                     molecule_tool_active = false;
                     bond_tool_active = false;
@@ -5480,8 +6864,11 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                     wall_dragging = false;
                     invalidate_simulation_ui(window, true);
                     break;
-                case 7:
+                case 10:
                     toggle_dimension_mode(window);
+                    break;
+                case 11:
+                    show_periodic_table(window);
                     break;
                 default:
                     break;
@@ -5498,41 +6885,6 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         {
             footer_visible = false;
             InvalidateRect(window, nullptr, FALSE);
-            return 0;
-        }
-        const RECT toolbar_close{
-            client_area.right - 34, client_area.top,
-            client_area.right - 4,
-            client_area.top + toolbar_height};
-        if (toolbar_visible &&
-            PtInRect(&toolbar_close, position))
-        {
-            toolbar_visible = false;
-            InvalidateRect(window, nullptr, FALSE);
-            return 0;
-        }
-        if (toolbar_visible && PtInRect(&help_button, position))
-        {
-            SetFocus(window);
-            show_help(window);
-            return 0;
-        }
-        if (toolbar_visible && PtInRect(&auto_button, position))
-        {
-            SetFocus(window);
-            configure_graphics_for_this_pc(window);
-            return 0;
-        }
-        if (toolbar_visible && PtInRect(&restart_button, position))
-        {
-            SetFocus(window);
-            restart_application(window);
-            return 0;
-        }
-        if (toolbar_visible && PtInRect(&interaction_button, position))
-        {
-            SetFocus(window);
-            show_interaction_menu(window);
             return 0;
         }
         if (toolbar_visible && PtInRect(&graphics_button, position))
@@ -5800,6 +7152,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command)
 {
+    apply_visual_style(visual_style);
     QueryPerformanceFrequency(&performance_frequency);
     telemetry.started_at = GetTickCount64();
 
