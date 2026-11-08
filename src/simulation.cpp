@@ -897,6 +897,7 @@ void Engine::resolve_particle_collisions()
     constexpr double contact_scale = 1.122462048309373;
     for (unsigned int iteration = 0; iteration < 3; ++iteration)
     {
+        bool overlaps_found = false;
         for (const NeighborPair& pair : neighbor_pairs_)
         {
             Particle& first = particles_[pair.first];
@@ -909,6 +910,7 @@ void Engine::resolve_particle_collisions()
             {
                 continue;
             }
+            overlaps_found = true;
 
             double distance = std::sqrt(distance_squared);
             Vec3 normal;
@@ -947,6 +949,10 @@ void Engine::resolve_particle_collisions()
                 first.velocity += normal * (-impulse * first_inverse_mass);
                 second.velocity += normal * (impulse * second_inverse_mass);
             }
+        }
+        if (!overlaps_found)
+        {
+            break;
         }
     }
 }

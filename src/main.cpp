@@ -52,6 +52,7 @@ constexpr UINT_PTR simulation_timer_id = 3;
 constexpr UINT_PTR motion_timer_interval_ms = 16;
 constexpr UINT simulation_timer_interval_ms = 8;
 constexpr unsigned int maximum_catch_up_steps = 12;
+constexpr double simulation_work_budget_ms = 4.0;
 constexpr double minimum_time_flow_factor = 0.25;
 constexpr double maximum_time_flow_factor = 4.0;
 constexpr std::size_t chart_sample_capacity = 3000;
@@ -255,6 +256,7 @@ struct Telemetry
     unsigned int frames_since_sample = 0;
     double frames_per_second = 0.0;
     double frame_time_ms = 0.0;
+    double simulation_step_time_ms = 0.0;
     double simulation_steps_per_second = 0.0;
     bool has_frame_sample = false;
     std::uint64_t last_simulation_step_sample = 0;
@@ -283,6 +285,8 @@ LARGE_INTEGER performance_frequency{};
 simulation::Engine simulation_engine;
 HDC window_device_context = nullptr;
 HGLRC open_gl_context = nullptr;
+GLuint sphere_display_lists[3]{};
+std::string graphics_renderer;
 HFONT title_font = nullptr;
 HFONT small_font = nullptr;
 HFONT button_font = nullptr;
@@ -1341,27 +1345,78 @@ void draw_sphere(const Vec3& center, double radius, bool preview = false,
         }
     }
 
-    for (int latitude = 0; latitude < latitude_steps; ++latitude)
+    const int quality_index = graphics_quality == GraphicsQuality::performance
+        ? 0
+        : graphics_quality == GraphicsQuality::quality ? 2 : 1;
+    GLuint& sphere_list = sphere_display_lists[quality_index];
+    if (sphere_list == 0)
     {
-        const double low_phi = -pi / 2.0 + pi * latitude / latitude_steps;
-        const double high_phi = -pi / 2.0 + pi * (latitude + 1) / latitude_steps;
-        glBegin(GL_QUAD_STRIP);
-        for (int longitude = 0; longitude <= longitude_steps; ++longitude)
+        sphere_list = glGenLists(1);
+        if (sphere_list != 0)
         {
-            const double theta = 2.0 * pi * longitude / longitude_steps;
-            for (const double phi : {low_phi, high_phi})
+            glNewList(sphere_list, GL_COMPILE);
+            for (int latitude = 0; latitude < latitude_steps; ++latitude)
             {
-                const Vec3 normal{
-                    std::cos(phi) * std::cos(theta),
-                    std::cos(phi) * std::sin(theta),
-                    std::sin(phi)};
-                glNormal3d(normal.x, normal.y, normal.z);
-                glVertex3d(center.x + radius * normal.x,
-                    center.y + radius * normal.y,
-                    center.z + radius * normal.z);
+                const double low_phi =
+                    -pi / 2.0 + pi * latitude / latitude_steps;
+                const double high_phi =
+                    -pi / 2.0 + pi * (latitude + 1) / latitude_steps;
+                glBegin(GL_QUAD_STRIP);
+                for (int longitude = 0; longitude <= longitude_steps;
+                    ++longitude)
+                {
+                    const double theta =
+                        2.0 * pi * longitude / longitude_steps;
+                    for (const double phi : {low_phi, high_phi})
+                    {
+                        const Vec3 normal{
+                            std::cos(phi) * std::cos(theta),
+                            std::cos(phi) * std::sin(theta),
+                            std::sin(phi)};
+                        glNormal3d(normal.x, normal.y, normal.z);
+                        glVertex3d(normal.x, normal.y, normal.z);
+                    }
+                }
+                glEnd();
             }
+            glEndList();
         }
-        glEnd();
+    }
+    if (sphere_list != 0)
+    {
+        glPushMatrix();
+        glTranslated(center.x, center.y, center.z);
+        glScaled(radius, radius, radius);
+        glCallList(sphere_list);
+        glPopMatrix();
+    }
+    else
+    {
+        for (int latitude = 0; latitude < latitude_steps; ++latitude)
+        {
+            const double low_phi =
+                -pi / 2.0 + pi * latitude / latitude_steps;
+            const double high_phi =
+                -pi / 2.0 + pi * (latitude + 1) / latitude_steps;
+            glBegin(GL_QUAD_STRIP);
+            for (int longitude = 0; longitude <= longitude_steps;
+                ++longitude)
+            {
+                const double theta = 2.0 * pi * longitude / longitude_steps;
+                for (const double phi : {low_phi, high_phi})
+                {
+                    const Vec3 normal{
+                        std::cos(phi) * std::cos(theta),
+                        std::cos(phi) * std::sin(theta),
+                        std::sin(phi)};
+                    glNormal3d(normal.x, normal.y, normal.z);
+                    glVertex3d(center.x + radius * normal.x,
+                        center.y + radius * normal.y,
+                        center.z + radius * normal.z);
+                }
+            }
+            glEnd();
+        }
     }
 
     if (preview)
@@ -1491,6 +1546,7 @@ void draw_interaction_force()
     glColor3ub(GetRValue(z_axis_color), GetGValue(z_axis_color),
         GetBValue(z_axis_color));
     const CameraBasis basis = camera_basis();
+    glBegin(GL_LINES);
     for (const simulation::Particle& particle :
         simulation_engine.particles())
     {
@@ -1511,7 +1567,6 @@ void draw_interaction_force()
         const double head_length = (std::min)(0.25, arrow_length * 0.3);
         const Vec3 head_base = endpoint - direction * head_length;
         const Vec3 wing = side * (head_length * 0.55);
-        glBegin(GL_LINES);
         glVertex3d(particle.position.x, particle.position.y, particle.position.z);
         glVertex3d(endpoint.x, endpoint.y, endpoint.z);
         glVertex3d(endpoint.x, endpoint.y, endpoint.z);
@@ -1520,8 +1575,8 @@ void draw_interaction_force()
         glVertex3d(endpoint.x, endpoint.y, endpoint.z);
         glVertex3d(head_base.x - wing.x, head_base.y - wing.y,
             head_base.z - wing.z);
-        glEnd();
     }
+    glEnd();
     glLineWidth(1.0F);
 }
 
@@ -1690,6 +1745,8 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     wchar_t fps_value[24]{};
     wchar_t steps_value[24]{};
     wchar_t frame_time_value[24]{};
+    wchar_t physics_time_value[24]{};
+    wchar_t renderer_value[192]{};
     wchar_t camera_value[32]{};
     wchar_t uptime_value[24]{};
     wchar_t memory_value[32]{};
@@ -1761,6 +1818,14 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
     {
         std::swprintf(frame_time_value,
             sizeof(frame_time_value) / sizeof(frame_time_value[0]), L"—");
+    }
+    std::swprintf(physics_time_value,
+        sizeof(physics_time_value) / sizeof(physics_time_value[0]),
+        L"%.1f ms", telemetry.simulation_step_time_ms);
+    if (!graphics_renderer.empty())
+    {
+        MultiByteToWideChar(CP_UTF8, 0, graphics_renderer.c_str(), -1,
+            renderer_value, static_cast<int>(std::size(renderer_value)));
     }
     const double camera_speed = std::sqrt(dot(camera_state.velocity, camera_state.velocity));
     std::swprintf(camera_value, sizeof(camera_value) / sizeof(camera_value[0]),
@@ -1859,6 +1924,7 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
         {L"STEPS / SEC", steps_value},
         {L"CHARGE", charge_value},
         {L"FRAME TIME", frame_time_value},
+        {L"PHYSICS STEP", physics_time_value},
         {L"CAMERA SPEED", camera_value},
         {L"UPTIME", uptime_value},
         {L"RAM / BUDGET", memory_value}};
@@ -1883,6 +1949,13 @@ void draw_footer(HDC device_context, const RECT& client_area, HFONT small_font,
             draw_line(device_context, left, footer.top + 69,
                 left, footer.top + 92, border_color);
         }
+    }
+    if (renderer_value[0] != L'\0')
+    {
+        draw_text(device_context, renderer_value,
+            RECT{client_area.left + 6, footer.top + 98,
+                client_area.right - 6, footer.bottom - 1},
+            muted_text_color, small_font);
     }
 
     draw_line(device_context, client_area.left, footer.top + 97,
@@ -5963,6 +6036,8 @@ void update_simulation(HWND window)
 
     unsigned int completed_steps = 0;
     std::string error;
+    LARGE_INTEGER work_started_at{};
+    QueryPerformanceCounter(&work_started_at);
     if (molecule_dragging && !update_interaction_force(window))
     {
         set_simulation_running(window, false);
@@ -5972,6 +6047,9 @@ void update_simulation(HWND window)
         completed_steps < maximum_steps_this_tick)
     {
         update_scenario(window, time_step);
+        LARGE_INTEGER step_started_at{};
+        LARGE_INTEGER step_finished_at{};
+        QueryPerformanceCounter(&step_started_at);
         if (!simulation_engine.step(error))
         {
             set_simulation_running(window, false);
@@ -5981,9 +6059,28 @@ void update_simulation(HWND window)
                 MB_OK | MB_ICONERROR);
             return;
         }
+        QueryPerformanceCounter(&step_finished_at);
+        const double step_time_ms = performance_frequency.QuadPart == 0
+            ? 0.0
+            : static_cast<double>(step_finished_at.QuadPart -
+                step_started_at.QuadPart) * 1000.0 /
+                static_cast<double>(performance_frequency.QuadPart);
+        telemetry.simulation_step_time_ms +=
+            (step_time_ms - telemetry.simulation_step_time_ms) * 0.15;
         simulation_time_accumulator -= time_step;
         ++completed_steps;
         record_chart_sample();
+        LARGE_INTEGER work_finished_at{};
+        QueryPerformanceCounter(&work_finished_at);
+        const double work_time_ms = performance_frequency.QuadPart == 0
+            ? 0.0
+            : static_cast<double>(work_finished_at.QuadPart -
+                work_started_at.QuadPart) * 1000.0 /
+                static_cast<double>(performance_frequency.QuadPart);
+        if (work_time_ms >= simulation_work_budget_ms)
+        {
+            break;
+        }
     }
 
     RECT client_area{};
@@ -6354,6 +6451,17 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         glShadeModel(GL_SMOOTH);
         glClearDepth(1.0);
         glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_NICEST);
+        const auto* vendor = reinterpret_cast<const char*>(
+            glGetString(GL_VENDOR));
+        const auto* renderer = reinterpret_cast<const char*>(
+            glGetString(GL_RENDERER));
+        const auto* version = reinterpret_cast<const char*>(
+            glGetString(GL_VERSION));
+        if (vendor != nullptr && renderer != nullptr && version != nullptr)
+        {
+            graphics_renderer = std::string(vendor) + " | " + renderer +
+                " | OpenGL " + version;
+        }
         wglMakeCurrent(nullptr, nullptr);
         if (!create_overlay_fonts())
         {
@@ -6474,12 +6582,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
         if (scene_rendered)
         {
-            HDC overlay_context = GetDC(window);
-            if (overlay_context != nullptr)
-            {
-                draw_overlay(overlay_context, client_area);
-                ReleaseDC(window, overlay_context);
-            }
+            draw_overlay(paint_context, client_area);
         }
         else if (!separate_interface_windows)
         {
@@ -7606,7 +7709,18 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         KillTimer(window, simulation_timer_id);
         if (open_gl_context != nullptr)
         {
-            wglMakeCurrent(nullptr, nullptr);
+            if (wglMakeCurrent(window_device_context, open_gl_context))
+            {
+                for (GLuint& sphere_list : sphere_display_lists)
+                {
+                    if (sphere_list != 0)
+                    {
+                        glDeleteLists(sphere_list, 1);
+                        sphere_list = 0;
+                    }
+                }
+                wglMakeCurrent(nullptr, nullptr);
+            }
             wglDeleteContext(open_gl_context);
             open_gl_context = nullptr;
         }
@@ -7626,6 +7740,24 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command)
 {
+    using SetDpiAwarenessContextFunction = BOOL(WINAPI*)(HANDLE);
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto set_dpi_awareness_context =
+        user32 == nullptr ? nullptr
+        : reinterpret_cast<SetDpiAwarenessContextFunction>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+    if (set_dpi_awareness_context != nullptr)
+    {
+        if (!set_dpi_awareness_context(
+                reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4))))
+        {
+            SetProcessDPIAware();
+        }
+    }
+    else
+    {
+        SetProcessDPIAware();
+    }
     apply_visual_style(visual_style);
     QueryPerformanceFrequency(&performance_frequency);
     telemetry.started_at = GetTickCount64();

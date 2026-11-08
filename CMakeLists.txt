@@ -8,6 +8,7 @@ include(CTest)
 
 set(BONDERIUM_VERSION "${PROJECT_VERSION}" CACHE STRING "Application version")
 option(BONDERIUM_ENABLE_UPDATES "Check GitHub Releases for application updates" OFF)
+option(BONDERIUM_BUILD_BENCHMARKS "Build the simulation performance benchmark" OFF)
 
 add_executable(Bonderium WIN32
     src/elements.cpp
@@ -49,6 +50,20 @@ if(BUILD_TESTING)
         target_compile_options(ElementTests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME ElementTests COMMAND ElementTests)
+endif()
+
+if(BONDERIUM_BUILD_BENCHMARKS)
+    add_executable(PerformanceBenchmarks
+        tests/performance_benchmark.cpp
+        src/simulation.cpp
+    )
+    target_compile_features(PerformanceBenchmarks PRIVATE cxx_std_20)
+    target_include_directories(PerformanceBenchmarks PRIVATE src)
+    if(MSVC)
+        target_compile_options(PerformanceBenchmarks PRIVATE /W4 /permissive- /utf-8)
+    else()
+        target_compile_options(PerformanceBenchmarks PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()
 
 if(MSVC)
