@@ -48,6 +48,22 @@ void test_lennard_jones_equilibrium()
     assert(near(engine.metrics().potential_energy, -1.0));
 }
 
+void test_large_particle_contact_expands_neighbor_search()
+{
+    simulation::Engine engine;
+    engine.config().cutoff = 0.5;
+    const double contact = 2.0 * std::pow(2.0, 1.0 / 6.0);
+    const std::size_t first = engine.add_particle({0.0, 0.0, 0.0});
+    const std::size_t second = engine.add_particle({contact, 0.0, 0.0});
+    assert(engine.set_particle_properties(first, 1.0, 0.0, 2.0, 1.0, false));
+    assert(engine.set_particle_properties(second, 1.0, 0.0, 2.0, 1.0, false));
+
+    std::string error;
+    assert(engine.step(error));
+    assert(engine.metrics().neighbor_pairs == 1);
+    assert(near(engine.metrics().potential_energy, -1.0));
+}
+
 void test_coulomb_force_and_energy()
 {
     simulation::Engine engine;
@@ -147,6 +163,72 @@ void test_external_force_changes_velocity_without_teleporting()
     assert(engine.set_external_force(particle, {}));
     assert(engine.step(error));
     assert(near(engine.particles()[particle].velocity.x, 0.04));
+}
+
+void test_persistent_and_transient_forces_are_independent()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle = engine.add_particle({0.0, 0.0, 0.0});
+    assert(engine.set_particle_properties(particle, 1.0, 0.0, 0.5, 0.0, false));
+    assert(engine.set_external_force(particle, {1.0, 0.0, 0.0}));
+    assert(engine.set_transient_force(particle, {0.0, 2.0, 0.0}));
+
+    std::string error;
+    assert(engine.step(error));
+    assert(engine.set_transient_force(particle, {}));
+    assert(engine.step(error));
+    assert(engine.particles()[particle].force.x == 1.0);
+    assert(engine.particles()[particle].force.y == 0.0);
+    assert(engine.particles()[particle].external_force.x == 1.0);
+    assert(engine.particles()[particle].transient_force.x == 0.0);
+}
+
+void test_particle_removal_reindexes_bonds_and_angles()
+{
+    simulation::Engine engine;
+    const std::size_t first = engine.add_particle({0.0, 0.0, 0.0});
+    const std::size_t center = engine.add_particle({1.0, 0.0, 0.0});
+    const std::size_t third = engine.add_particle({1.0, 1.0, 0.0});
+    const std::size_t isolated = engine.add_particle({4.0, 0.0, 0.0});
+    std::string error;
+    assert(engine.add_bond({first, center, 1.0, 1.0}, error));
+    assert(engine.add_bond({center, third, 1.0, 1.0}, error));
+    assert(engine.angles().size() == 1);
+    assert(engine.remove_particles({0, 0}));
+    assert(engine.particles().size() == 3);
+    assert(engine.bonds().size() == 1);
+    assert(engine.bonds()[0].first == 0);
+    assert(engine.bonds()[0].second == 1);
+    assert(engine.angles().empty());
+    assert(engine.particles()[2].position.x == 4.0);
+    assert(!engine.remove_particles({isolated}));
+
+    assert(engine.add_wall({{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, false},
+        error));
+    engine.clear_walls();
+    assert(engine.walls().empty());
+}
+
+void test_overlapping_particles_are_resolved_without_penetration()
+{
+    simulation::Engine engine;
+    const std::size_t first = engine.add_particle({0.0, 0.0, 0.0});
+    const std::size_t second = engine.add_particle({0.5, 0.0, 0.0});
+    assert(engine.set_particle_properties(first, 1.0, 0.0, 1.0, 0.0, true));
+    assert(engine.set_particle_properties(second, 1.0, 0.0, 1.0, 0.0, false));
+    assert(engine.set_velocity(second, {-1.0, 0.0, 0.0}));
+
+    std::string error;
+    assert(engine.step(error));
+    const simulation::Vec3 displacement{
+        engine.particles()[1].position.x - engine.particles()[0].position.x,
+        engine.particles()[1].position.y - engine.particles()[0].position.y,
+        engine.particles()[1].position.z - engine.particles()[0].position.z};
+    assert(std::sqrt(displacement.x * displacement.x +
+        displacement.y * displacement.y + displacement.z * displacement.z) >=
+        std::pow(2.0, 1.0 / 6.0) - tolerance);
+    assert(engine.particles()[1].velocity.x > 0.0);
 }
 
 void test_freezing_stops_motion_and_releases_applied_force()
@@ -290,7 +372,7 @@ void test_virial_pressure_includes_lennard_jones_interactions()
     assert(near(engine.metrics().pressure, 24.0 / 3000.0));
 }
 
-void test_soft_wall_force_and_overlapping_particle_error()
+void test_soft_wall_force_and_overlapping_particle_resolution()
 {
     simulation::Engine wall_engine;
     wall_engine.config().boundary_mode = simulation::BoundaryMode::soft;
@@ -312,8 +394,10 @@ void test_soft_wall_force_and_overlapping_particle_error()
     assert(overlap_engine.set_particle_properties(
         second, 1.0, 0.0, 1.0, 1.0, false));
     error.clear();
-    assert(!overlap_engine.step(error));
-    assert(!error.empty());
+    assert(overlap_engine.step(error));
+    assert(error.empty());
+    assert(near(overlap_engine.particles()[1].position.x -
+        overlap_engine.particles()[0].position.x, std::pow(2.0, 1.0 / 6.0)));
 }
 
 void test_reflective_boundary_and_thermostat_modes()
@@ -328,7 +412,8 @@ void test_reflective_boundary_and_thermostat_modes()
 
     std::string error;
     assert(engine.step(error));
-    assert(near(engine.particles()[particle].position.x, 1.0));
+    assert(near(engine.particles()[particle].position.x,
+        1.0 - 0.75 * 0.5612310241546865));
     assert(engine.particles()[particle].velocity.x < 0.0);
 
     for (const simulation::Thermostat thermostat : {
@@ -441,11 +526,15 @@ void test_particle_element_identity()
 int main()
 {
     test_lennard_jones_equilibrium();
+    test_large_particle_contact_expands_neighbor_search();
     test_coulomb_force_and_energy();
     test_coulomb_remains_long_range_and_tracks_charge_changes();
     test_neighbor_cache_and_invalidation();
     test_harmonic_bond();
     test_external_force_changes_velocity_without_teleporting();
+    test_persistent_and_transient_forces_are_independent();
+    test_particle_removal_reindexes_bonds_and_angles();
+    test_overlapping_particles_are_resolved_without_penetration();
     test_freezing_stops_motion_and_releases_applied_force();
     test_harmonic_angle();
     test_angle_force_matches_energy_gradient();
@@ -453,7 +542,7 @@ int main()
     test_force_cache_tracks_config_changes();
     test_thermodynamic_metrics_for_confined_gas();
     test_virial_pressure_includes_lennard_jones_interactions();
-    test_soft_wall_force_and_overlapping_particle_error();
+    test_soft_wall_force_and_overlapping_particle_resolution();
     test_reflective_boundary_and_thermostat_modes();
     test_barnes_hut_coulomb_path();
     test_dimension_mode_constrains_particles_to_xy();

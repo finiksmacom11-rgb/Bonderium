@@ -20,6 +20,7 @@ struct Particle
     Vec3 velocity;
     Vec3 force;
     Vec3 external_force;
+    Vec3 transient_force;
     int atomic_number = 6;
     double mass = 1.0;
     double charge = 0.0;
@@ -127,11 +128,14 @@ public:
     bool set_position(std::size_t index, Vec3 position);
     bool set_velocity(std::size_t index, Vec3 velocity);
     bool set_external_force(std::size_t index, Vec3 force);
+    bool set_transient_force(std::size_t index, Vec3 force);
     bool set_particle_fixed(std::size_t index, bool fixed);
     bool set_charge(std::size_t index, double charge);
     bool set_particle_element(std::size_t index, int atomic_number);
     bool set_particle_properties(std::size_t index, double mass, double charge,
         double sigma, double epsilon, bool fixed);
+    bool remove_particles(const std::vector<std::size_t>& indices);
+    void clear_walls();
     void clear();
     void invalidate_neighbors();
     void invalidate_forces();
@@ -154,9 +158,11 @@ private:
 
     bool validate_config(std::string& error) const;
     bool force_configuration_matches() const;
+    double neighbor_search_radius() const;
     bool compute_forces(std::string& error);
     void rebuild_neighbor_list();
     bool needs_neighbor_rebuild() const;
+    void resolve_particle_collisions();
     void apply_boundaries();
     void apply_walls(const std::vector<Vec3>& previous_positions);
     void apply_thermostat();

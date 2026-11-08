@@ -526,6 +526,7 @@ bool Engine::set_dimension_mode(bool two_dimensional)
             particle.position.z = 0.0;
             particle.velocity.z = 0.0;
             particle.external_force.z = 0.0;
+            particle.transient_force.z = 0.0;
             particle.force.z = 0.0;
         }
     }
@@ -582,6 +583,25 @@ bool Engine::set_external_force(std::size_t index, Vec3 force)
     return true;
 }
 
+bool Engine::set_transient_force(std::size_t index, Vec3 force)
+{
+    if (index >= particles_.size() || !finite(force))
+    {
+        return false;
+    }
+    if (config_.two_dimensional)
+    {
+        force.z = 0.0;
+    }
+    Particle& particle = particles_[index];
+    if (forces_initialized_)
+    {
+        particle.force += force - particle.transient_force;
+    }
+    particle.transient_force = force;
+    return true;
+}
+
 bool Engine::set_particle_fixed(std::size_t index, bool fixed)
 {
     if (index >= particles_.size())
@@ -596,6 +616,7 @@ bool Engine::set_particle_fixed(std::size_t index, bool fixed)
         {
             particle.velocity = Vec3{};
             particle.external_force = Vec3{};
+            particle.transient_force = Vec3{};
         }
         forces_initialized_ = false;
     }
@@ -652,6 +673,74 @@ bool Engine::set_particle_properties(std::size_t index, double mass,
     return true;
 }
 
+bool Engine::remove_particles(const std::vector<std::size_t>& indices)
+{
+    if (indices.empty())
+    {
+        return true;
+    }
+    std::vector<bool> removed(particles_.size(), false);
+    std::size_t removed_count = 0;
+    for (const std::size_t index : indices)
+    {
+        if (index >= particles_.size())
+        {
+            return false;
+        }
+        if (!removed[index])
+        {
+            removed[index] = true;
+            ++removed_count;
+        }
+    }
+
+    std::vector<std::size_t> remap(particles_.size(), particles_.size());
+    std::vector<Particle> remaining;
+    remaining.reserve(particles_.size() - removed_count);
+    for (std::size_t index = 0; index < particles_.size(); ++index)
+    {
+        if (!removed[index])
+        {
+            remap[index] = remaining.size();
+            remaining.push_back(particles_[index]);
+        }
+    }
+    particles_.swap(remaining);
+
+    bonds_.erase(std::remove_if(bonds_.begin(), bonds_.end(),
+        [&removed](const Bond& bond) {
+            return removed[bond.first] || removed[bond.second];
+        }), bonds_.end());
+    for (Bond& bond : bonds_)
+    {
+        bond.first = remap[bond.first];
+        bond.second = remap[bond.second];
+    }
+    angles_.erase(std::remove_if(angles_.begin(), angles_.end(),
+        [&removed](const Angle& angle) {
+            return removed[angle.first] || removed[angle.center] ||
+                removed[angle.third];
+        }), angles_.end());
+    for (Angle& angle : angles_)
+    {
+        angle.first = remap[angle.first];
+        angle.center = remap[angle.center];
+        angle.third = remap[angle.third];
+    }
+    invalidate_neighbors();
+    charged_particles_dirty_ = true;
+    forces_initialized_ = false;
+    metrics_.potential_energy = 0.0;
+    metrics_.configurational_virial = 0.0;
+    update_metrics();
+    return true;
+}
+
+void Engine::clear_walls()
+{
+    walls_.clear();
+}
+
 void Engine::clear()
 {
     std::vector<Particle>().swap(particles_);
@@ -671,6 +760,8 @@ void Engine::clear()
 void Engine::invalidate_neighbors()
 {
     neighbor_reference_positions_.clear();
+    neighbor_pairs_.clear();
+    metrics_.neighbor_pairs = 0;
 }
 
 void Engine::invalidate_forces()
@@ -789,10 +880,82 @@ bool Engine::needs_neighbor_rebuild() const
     return false;
 }
 
+double Engine::neighbor_search_radius() const
+{
+    double maximum_sigma = 0.0;
+    for (const Particle& particle : particles_)
+    {
+        maximum_sigma = (std::max)(maximum_sigma, particle.sigma);
+    }
+    constexpr double lennard_jones_contact = 1.122462048309373;
+    return (std::max)(config_.cutoff,
+        maximum_sigma * lennard_jones_contact);
+}
+
+void Engine::resolve_particle_collisions()
+{
+    constexpr double contact_scale = 1.122462048309373;
+    for (unsigned int iteration = 0; iteration < 3; ++iteration)
+    {
+        for (const NeighborPair& pair : neighbor_pairs_)
+        {
+            Particle& first = particles_[pair.first];
+            Particle& second = particles_[pair.second];
+            const double contact_distance =
+                0.5 * (first.sigma + second.sigma) * contact_scale;
+            Vec3 displacement = second.position - first.position;
+            double distance_squared = length_squared(displacement);
+            if (distance_squared >= contact_distance * contact_distance)
+            {
+                continue;
+            }
+
+            double distance = std::sqrt(distance_squared);
+            Vec3 normal;
+            if (distance > 1e-12)
+            {
+                normal = displacement / distance;
+            }
+            else
+            {
+                normal = Vec3{1.0, 0.0, 0.0};
+                distance = 0.0;
+            }
+            const double first_inverse_mass =
+                first.fixed ? 0.0 : 1.0 / first.mass;
+            const double second_inverse_mass =
+                second.fixed ? 0.0 : 1.0 / second.mass;
+            const double inverse_mass_sum =
+                first_inverse_mass + second_inverse_mass;
+            if (inverse_mass_sum <= 0.0)
+            {
+                continue;
+            }
+
+            const double overlap = contact_distance - distance + 1e-9;
+            first.position += normal *
+                (-overlap * first_inverse_mass / inverse_mass_sum);
+            second.position += normal *
+                (overlap * second_inverse_mass / inverse_mass_sum);
+
+            const double relative_normal_velocity =
+                dot(second.velocity - first.velocity, normal);
+            if (relative_normal_velocity < 0.0)
+            {
+                const double impulse = -(1.0 + config_.restitution) *
+                    relative_normal_velocity / inverse_mass_sum;
+                first.velocity += normal * (-impulse * first_inverse_mass);
+                second.velocity += normal * (impulse * second_inverse_mass);
+            }
+        }
+    }
+}
+
 void Engine::rebuild_neighbor_list()
 {
     neighbor_pairs_.clear();
-    const double radius = config_.cutoff + config_.neighbor_skin;
+    const double search_radius = neighbor_search_radius();
+    const double radius = search_radius + config_.neighbor_skin;
     const double radius_squared = radius * radius;
     std::unordered_map<Cell, std::vector<std::size_t>, CellHash> cells;
     for (std::size_t index = 0; index < particles_.size(); ++index)
@@ -897,14 +1060,14 @@ bool Engine::compute_forces(std::string& error)
             particle.position.z = 0.0;
             particle.velocity.z = 0.0;
         }
-        particle.force = particle.external_force +
+        particle.force = particle.external_force + particle.transient_force +
             Vec3{0.0, 0.0, config_.two_dimensional
                 ? 0.0 : particle.mass * config_.gravity_z};
     }
 
     double potential_energy = 0.0;
     double virial = 0.0;
-    const double cutoff_squared = config_.cutoff * config_.cutoff;
+    constexpr double contact_scale = 1.122462048309373;
     for (const NeighborPair& pair : neighbor_pairs_)
     {
         const std::size_t first_index = pair.first;
@@ -913,6 +1076,8 @@ bool Engine::compute_forces(std::string& error)
         Particle& second = particles_[second_index];
         const double sigma = 0.5 * (first.sigma + second.sigma);
         const double epsilon = std::sqrt(first.epsilon * second.epsilon);
+        const double cutoff = (std::max)(
+            config_.cutoff, sigma * contact_scale);
         const Vec3 displacement = first.position - second.position;
         const double distance_squared = length_squared(displacement);
         if (distance_squared < minimum_squared_distance)
@@ -924,7 +1089,7 @@ bool Engine::compute_forces(std::string& error)
             }
             continue;
         }
-        if (distance_squared > cutoff_squared)
+        if (epsilon <= 0.0 || distance_squared > cutoff * cutoff)
         {
             continue;
         }
@@ -1192,6 +1357,8 @@ void Engine::apply_boundaries()
         {
             continue;
         }
+        constexpr double radius_scale = 0.5612310241546865;
+        const double radius = particle.sigma * radius_scale;
         double* coordinates[]{&particle.position.x, &particle.position.y,
             &particle.position.z};
         double* velocities[]{&particle.velocity.x, &particle.velocity.y,
@@ -1199,15 +1366,17 @@ void Engine::apply_boundaries()
         const std::size_t axis_count = config_.two_dimensional ? 2 : 3;
         for (std::size_t axis = 0; axis < axis_count; ++axis)
         {
-            if (*coordinates[axis] < config_.boundary_min)
+            const double minimum = config_.boundary_min + radius;
+            const double maximum = config_.boundary_max - radius;
+            if (*coordinates[axis] < minimum)
             {
-                *coordinates[axis] = config_.boundary_min;
+                *coordinates[axis] = minimum;
                 *velocities[axis] = std::abs(*velocities[axis]) *
                     config_.restitution;
             }
-            else if (*coordinates[axis] > config_.boundary_max)
+            else if (*coordinates[axis] > maximum)
             {
-                *coordinates[axis] = config_.boundary_max;
+                *coordinates[axis] = maximum;
                 *velocities[axis] = -std::abs(*velocities[axis]) *
                     config_.restitution;
             }
@@ -1217,7 +1386,7 @@ void Engine::apply_boundaries()
 
 void Engine::apply_walls(const std::vector<Vec3>& previous_positions)
 {
-    constexpr double particle_radius_scale = 0.25;
+    constexpr double particle_radius_scale = 0.5612310241546865;
     for (std::size_t index = 0; index < particles_.size(); ++index)
     {
         Particle& particle = particles_[index];
@@ -1479,9 +1648,22 @@ bool Engine::step(std::string& error)
     {
         forces_initialized_ = false;
     }
-    if (!forces_initialized_ && !compute_forces(error))
+    if (!forces_initialized_)
     {
-        return false;
+        if (needs_neighbor_rebuild())
+        {
+            rebuild_neighbor_list();
+            if (neighbor_reference_positions_.size() != particles_.size())
+            {
+                error = "Particle coordinates exceed the supported neighbor-grid range.";
+                return false;
+            }
+        }
+        resolve_particle_collisions();
+        if (!compute_forces(error))
+        {
+            return false;
+        }
     }
 
     std::vector<Vec3> previous_positions;
@@ -1513,6 +1695,16 @@ bool Engine::step(std::string& error)
     }
     apply_boundaries();
     apply_walls(previous_positions);
+    if (needs_neighbor_rebuild())
+    {
+        rebuild_neighbor_list();
+        if (neighbor_reference_positions_.size() != particles_.size())
+        {
+            error = "Particle coordinates exceed the supported neighbor-grid range.";
+            return false;
+        }
+    }
+    resolve_particle_collisions();
     if (!compute_forces(error))
     {
         return false;

@@ -65,7 +65,7 @@ constexpr double camera_zoom_factor = 1.15;
 constexpr double camera_move_speed = 12.0;
 constexpr double camera_ease_seconds = 0.12;
 constexpr double camera_stop_threshold = 0.015;
-constexpr double molecule_radius = 0.42;
+constexpr double molecule_radius = 0.68;
 constexpr double spring_drag_stiffness = 30.0;
 constexpr double directional_force_scale = 18.0;
 constexpr double maximum_interaction_force = 200.0;
@@ -183,7 +183,8 @@ enum class MolecularTool
 {
     select,
     multi_select,
-    square_lattice
+    square_lattice,
+    lasso_select
 };
 
 enum class ScenarioAction
@@ -225,6 +226,14 @@ enum ScenarioMenuCommand : UINT
 {
     menu_scenario_force_step = 201,
     menu_scenario_lattice_step
+};
+
+enum ObjectMenuCommand : UINT
+{
+    menu_delete_selected_particles = 301,
+    menu_delete_all_particles,
+    menu_delete_all_walls,
+    menu_clear_world
 };
 
 using simulation::Vec3;
@@ -332,6 +341,8 @@ int selected_element_number = 6;
 int highlighted_element_number = 6;
 bool square_lattice_dragging = false;
 bool square_lattice_for_scenario = false;
+bool lasso_dragging = false;
+std::vector<POINT> lasso_points;
 double pending_lattice_duration = 1.0;
 Vec3 square_lattice_start{};
 Vec3 square_lattice_end{};
@@ -406,7 +417,19 @@ double element_model_mass(const elements::Element& element)
 
 double element_model_sigma(const elements::Element& element)
 {
-    return (std::clamp)(element.covalent_radius_pm * 0.0075, 0.35, 1.8);
+    return (std::clamp)(element.covalent_radius_pm * 0.016, 0.35, 4.2);
+}
+
+double particle_display_radius(double sigma)
+{
+    return sigma * 0.5612310241546865;
+}
+
+double element_display_radius(int atomic_number)
+{
+    const elements::Element* element = elements::find(atomic_number);
+    return element == nullptr ? molecule_radius
+                              : particle_display_radius(element_model_sigma(*element));
 }
 
 double element_model_epsilon(const elements::Element& element)
@@ -540,7 +563,9 @@ RECT tools_panel_area(const RECT& client_area)
 RECT tools_panel_button_area(const RECT& client_area, int row)
 {
     const RECT panel = tools_panel_area(client_area);
-    const int top = panel.top + 48 + row * 36;
+    const int row_spacing =
+        workspace_page == WorkspacePage::objects ? 31 : 36;
+    const int top = panel.top + 48 + row * row_spacing;
     return RECT{panel.left + 12, top, panel.right - 12, top + 30};
 }
 
@@ -1047,7 +1072,8 @@ std::uint64_t pick_molecule(const RECT& client_area, POINT screen)
             continue;
         }
         const double screen_radius =
-            molecule_radius * pixels_per_unit / depth + 5.0;
+            particle_display_radius(particles[index].sigma) *
+                pixels_per_unit / depth + 5.0;
         const double dx = static_cast<double>(screen.x - center.x);
         const double dy = static_cast<double>(screen.y - center.y);
         if (dx * dx + dy * dy <= screen_radius * screen_radius &&
@@ -1352,9 +1378,9 @@ void draw_molecules(const RECT& client_area)
     {
         const Vec3 position = particles[index].position;
         const Vec3 offset = position - camera_state.target;
+        const double radius = particle_display_radius(particles[index].sigma);
         if (dot(offset, offset) >
-            (cull_distance + molecule_radius) *
-                (cull_distance + molecule_radius))
+            (cull_distance + radius) * (cull_distance + radius))
         {
             continue;
         }
@@ -1362,7 +1388,7 @@ void draw_molecules(const RECT& client_area)
             static_cast<std::uint64_t>(index + 1) == selected_molecule_id ||
             std::find(selected_particles.begin(), selected_particles.end(),
                 index) != selected_particles.end();
-        draw_sphere(position, molecule_radius, false, selected,
+        draw_sphere(position, radius, false, selected,
             particles[index].charge, particles[index].atomic_number);
     }
 
@@ -1375,7 +1401,8 @@ void draw_molecules(const RECT& client_area)
     {
         draw_sphere(
             Vec3{preview_position.x, preview_position.y, preview_z},
-            molecule_radius, true, false, 0.0, selected_element_number);
+            element_display_radius(selected_element_number), true, false,
+            0.0, selected_element_number);
     }
 }
 
@@ -1459,27 +1486,42 @@ void draw_bonds()
 
 void draw_interaction_force()
 {
-    if (!molecule_dragging ||
-        interacting_particle >= simulation_engine.particles().size())
-    {
-        return;
-    }
-    const simulation::Particle& particle =
-        simulation_engine.particles()[interacting_particle];
-    if (dot(particle.external_force, particle.external_force) < 1e-12)
-    {
-        return;
-    }
-    const Vec3 endpoint =
-        particle.position + particle.external_force * 0.05;
     glDisable(GL_LIGHTING);
-    glLineWidth(3.0F);
+    glLineWidth(2.0F);
     glColor3ub(GetRValue(z_axis_color), GetGValue(z_axis_color),
         GetBValue(z_axis_color));
-    glBegin(GL_LINES);
-    glVertex3d(particle.position.x, particle.position.y, particle.position.z);
-    glVertex3d(endpoint.x, endpoint.y, endpoint.z);
-    glEnd();
+    const CameraBasis basis = camera_basis();
+    for (const simulation::Particle& particle :
+        simulation_engine.particles())
+    {
+        const Vec3 force = particle.external_force + particle.transient_force;
+        const double magnitude = std::sqrt(dot(force, force));
+        if (magnitude < 1e-9)
+        {
+            continue;
+        }
+        const Vec3 direction = force * (1.0 / magnitude);
+        const double arrow_length = (std::min)(5.0, magnitude * 0.05);
+        const Vec3 endpoint = particle.position + direction * arrow_length;
+        Vec3 side = normalized(cross(direction, basis.forward));
+        if (dot(side, side) < 1e-12)
+        {
+            side = normalized(cross(direction, basis.up));
+        }
+        const double head_length = (std::min)(0.25, arrow_length * 0.3);
+        const Vec3 head_base = endpoint - direction * head_length;
+        const Vec3 wing = side * (head_length * 0.55);
+        glBegin(GL_LINES);
+        glVertex3d(particle.position.x, particle.position.y, particle.position.z);
+        glVertex3d(endpoint.x, endpoint.y, endpoint.z);
+        glVertex3d(endpoint.x, endpoint.y, endpoint.z);
+        glVertex3d(head_base.x + wing.x, head_base.y + wing.y,
+            head_base.z + wing.z);
+        glVertex3d(endpoint.x, endpoint.y, endpoint.z);
+        glVertex3d(head_base.x - wing.x, head_base.y - wing.y,
+            head_base.z - wing.z);
+        glEnd();
+    }
     glLineWidth(1.0F);
 }
 
@@ -2206,6 +2248,17 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
         draw_tool_button(tools_panel_button_area(client_area, 11),
             element_button, false);
     }
+    draw_tool_button(tools_panel_button_area(client_area, 12),
+        molecular_tool == MolecularTool::lasso_select
+            ? L"ЛАССО: ОБВЕДИТЕ АТОМЫ"
+            : L"ВЫДЕЛЕНИЕ ЛАССО",
+        molecular_tool == MolecularTool::lasso_select);
+    draw_tool_button(tools_panel_button_area(client_area, 13),
+        L"УДАЛЕНИЕ ОБЪЕКТОВ…", false);
+    draw_tool_button(tools_panel_button_area(client_area, 14),
+        L"ДОБАВИТЬ ПОСТОЯННУЮ СИЛУ", false);
+    draw_tool_button(tools_panel_button_area(client_area, 15),
+        L"СНЯТЬ ПОСТОЯННУЮ СИЛУ", false);
 
     wchar_t selection_label[48]{};
     std::swprintf(selection_label,
@@ -2214,8 +2267,8 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
         static_cast<unsigned long long>(selected_particles.empty() &&
                 selected_molecule_id != 0 ? 1 : selected_particles.size()));
     draw_text(device_context, selection_label,
-        RECT{panel.left + 12, panel.top + 452,
-            panel.right - 12, panel.top + 316},
+        RECT{panel.left + 12, panel.top + 624,
+            panel.right - 12, panel.top + 642},
         muted_text_color, small_font);
     if (!scenario_steps.empty())
     {
@@ -2225,14 +2278,30 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
             L"ШАГОВ СЦЕНАРИЯ: %llu",
             static_cast<unsigned long long>(scenario_steps.size()));
         draw_text(device_context, scenario_label,
-            RECT{panel.left + 12, panel.top + 474,
-                panel.right - 12, panel.top + 338},
+            RECT{panel.left + 12, panel.top + 646,
+                panel.right - 12, panel.top + 664},
             muted_text_color, small_font);
     }
 }
 
 void draw_overlay(HDC device_context, const RECT& client_area)
 {
+    if (lasso_dragging && lasso_points.size() > 1)
+    {
+        HPEN lasso_pen = CreatePen(PS_SOLID, 2, x_axis_color);
+        if (lasso_pen != nullptr)
+        {
+            HGDIOBJ previous_pen = SelectObject(device_context, lasso_pen);
+            Polyline(device_context, lasso_points.data(),
+                static_cast<int>(lasso_points.size()));
+            MoveToEx(device_context, lasso_points.back().x,
+                lasso_points.back().y, nullptr);
+            LineTo(device_context, lasso_points.front().x,
+                lasso_points.front().y);
+            SelectObject(device_context, previous_pen);
+            DeleteObject(lasso_pen);
+        }
+    }
     if (separate_interface_windows)
     {
         return;
@@ -3606,7 +3675,7 @@ void set_interaction_tool(HWND window, InteractionTool tool)
         interacting_particle = static_cast<std::size_t>(-1);
         if (active_index < simulation_engine.particles().size())
         {
-            simulation_engine.set_external_force(active_index, Vec3{});
+            simulation_engine.set_transient_force(active_index, Vec3{});
         }
         ReleaseCapture();
     }
@@ -3707,6 +3776,8 @@ void set_molecule_tool(HWND window, bool active)
     molecular_tool = MolecularTool::select;
     square_lattice_dragging = false;
     square_lattice_for_scenario = false;
+    lasso_dragging = false;
+    lasso_points.clear();
     pending_bond_molecule_id = 0;
     pointer_over_scene = false;
     POINT cursor{};
@@ -3843,7 +3914,7 @@ bool update_interaction_force(HWND window)
     }
 
     force = limit_interaction_force(force);
-    if (!simulation_engine.set_external_force(interacting_particle, force))
+    if (!simulation_engine.set_transient_force(interacting_particle, force))
     {
         MessageBoxW(window, L"Unable to apply the interaction force.",
             L"Simulation error", MB_OK | MB_ICONERROR);
@@ -3858,7 +3929,7 @@ void stop_molecule_interaction(HWND window)
     molecule_dragging = false;
     interacting_particle = static_cast<std::size_t>(-1);
     if (active_index < simulation_engine.particles().size() &&
-        !simulation_engine.set_external_force(active_index, Vec3{}))
+        !simulation_engine.set_transient_force(active_index, Vec3{}))
     {
         MessageBoxW(window, L"Unable to release the applied molecule force.",
             L"Simulation error", MB_OK | MB_ICONERROR);
@@ -4406,6 +4477,11 @@ bool element_matches_search(const elements::Element& element,
 void accept_periodic_table_selection(HWND window)
 {
     selected_element_number = highlighted_element_number;
+    if (!simulation_engine.config().two_dimensional)
+    {
+        molecule_placement_height = element_display_radius(
+            selected_element_number);
+    }
     if (element_table_window == window)
     {
         DestroyWindow(window);
@@ -4821,6 +4897,279 @@ bool parse_input_number(const wchar_t* text, double& value)
     wchar_t* end = nullptr;
     value = std::wcstod(text, &end);
     return end != text && *end == L'\0' && std::isfinite(value);
+}
+
+bool point_in_lasso(POINT point)
+{
+    bool inside = false;
+    for (std::size_t index = 0, previous = lasso_points.size() - 1;
+         index < lasso_points.size(); previous = index++)
+    {
+        const POINT& first = lasso_points[index];
+        const POINT& second = lasso_points[previous];
+        if ((first.y > point.y) != (second.y > point.y))
+        {
+            const double crossing_x = first.x +
+                static_cast<double>(second.x - first.x) *
+                    (point.y - first.y) / (second.y - first.y);
+            if (point.x < crossing_x)
+            {
+                inside = !inside;
+            }
+        }
+    }
+    return inside;
+}
+
+void finish_lasso_selection(HWND window, const RECT& client_area)
+{
+    if (lasso_points.size() < 3)
+    {
+        lasso_points.clear();
+        const RECT area = scene_area(client_area);
+        InvalidateRect(window, &area, FALSE);
+        return;
+    }
+    selected_particles.clear();
+    selected_molecule_id = 0;
+    const auto& particles = simulation_engine.particles();
+    for (std::size_t index = 0; index < particles.size(); ++index)
+    {
+        POINT projected{};
+        double depth = 0.0;
+        if (world_to_screen(client_area, particles[index].position,
+                projected, depth) && point_in_lasso(projected))
+        {
+            selected_particles.push_back(index);
+        }
+    }
+    if (!selected_particles.empty())
+    {
+        selected_molecule_id =
+            static_cast<std::uint64_t>(selected_particles.back() + 1);
+    }
+    lasso_points.clear();
+    invalidate_simulation_ui(window, false);
+}
+
+void add_constant_force_to_selection(HWND window)
+{
+    const std::vector<std::size_t> selection = current_selection();
+    if (selection.empty())
+    {
+        MessageBoxW(window, L"Выберите атомы, к которым нужно добавить силу.",
+            L"Постоянная сила", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    InputDialogState dialog;
+    dialog.title = L"Добавить постоянную силу";
+    dialog.field_count = 3;
+    dialog.labels[0] = L"Добавочная сила по X (−100…100):";
+    dialog.labels[1] = L"Добавочная сила по Y (−100…100):";
+    dialog.labels[2] = L"Добавочная сила по Z (−100…100):";
+    for (std::size_t index = 0; index < 3; ++index)
+    {
+        std::swprintf(dialog.values[index], std::size(dialog.values[index]),
+            L"0");
+    }
+    if (!show_input_dialog(window, dialog))
+    {
+        return;
+    }
+    Vec3 increment{};
+    if (!parse_input_number(dialog.values[0], increment.x) ||
+        !parse_input_number(dialog.values[1], increment.y) ||
+        !parse_input_number(dialog.values[2], increment.z) ||
+        std::abs(increment.x) > 100.0 ||
+        std::abs(increment.y) > 100.0 ||
+        std::abs(increment.z) > 100.0)
+    {
+        MessageBoxW(window,
+            L"Каждая компонента должна быть числом от −100 до 100.",
+            L"Некорректная сила", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    for (const std::size_t index : selection)
+    {
+        const Vec3 force = simulation_engine.particles()[index].external_force +
+            increment;
+        if (!simulation_engine.set_external_force(
+                index, limit_interaction_force(force)))
+        {
+            MessageBoxW(window, L"Не удалось сохранить постоянную силу.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void clear_constant_force_from_selection(HWND window)
+{
+    const std::vector<std::size_t> selection = current_selection();
+    if (selection.empty())
+    {
+        MessageBoxW(window, L"Выберите атомы, с которых нужно снять силу.",
+            L"Постоянная сила", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    for (const std::size_t index : selection)
+    {
+        if (!simulation_engine.set_external_force(index, Vec3{}))
+        {
+            MessageBoxW(window, L"Не удалось снять постоянную силу.",
+                L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    invalidate_simulation_ui(window, true);
+}
+
+void reset_selection_after_deletion()
+{
+    selected_particles.clear();
+    selected_molecule_id = 0;
+    pending_bond_molecule_id = 0;
+    chart_particle_indices.clear();
+    chart_sample_count = 0;
+    chart_next_sample = 0;
+    chart_last_recorded_step = simulation_engine.metrics().steps;
+    chart_selection_initialized = false;
+}
+
+void remove_selected_particles(HWND window)
+{
+    const std::vector<std::size_t> removal = current_selection();
+    if (removal.empty())
+    {
+        MessageBoxW(window, L"Сначала выделите частицы для удаления.",
+            L"Удаление частиц", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    stop_molecule_interaction(window);
+    stop_scenario(window);
+    scenario_steps.clear();
+    if (!simulation_engine.remove_particles(removal))
+    {
+        MessageBoxW(window, L"Не удалось удалить выбранные частицы.",
+            L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+        return;
+    }
+    reset_selection_after_deletion();
+    invalidate_simulation_ui(window, true);
+}
+
+void delete_all_particles(HWND window)
+{
+    if (simulation_engine.particles().empty())
+    {
+        return;
+    }
+    if (MessageBoxW(window,
+            L"Удалить все частицы? Стены останутся на сцене.",
+            L"Удалить все частицы",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+    {
+        return;
+    }
+    set_simulation_running(window, false);
+    stop_molecule_interaction(window);
+    stop_scenario(window);
+    scenario_steps.clear();
+    std::vector<std::size_t> removal;
+    removal.reserve(simulation_engine.particles().size());
+    for (std::size_t index = 0;
+         index < simulation_engine.particles().size(); ++index)
+    {
+        removal.push_back(index);
+    }
+    if (!simulation_engine.remove_particles(removal))
+    {
+        MessageBoxW(window, L"Не удалось удалить частицы.",
+            L"Ошибка симуляции", MB_OK | MB_ICONERROR);
+        return;
+    }
+    reset_selection_after_deletion();
+    invalidate_simulation_ui(window, true);
+}
+
+void clear_entire_world(HWND window)
+{
+    if (MessageBoxW(window,
+            L"Удалить все частицы, связи, стены и записанные графики?",
+            L"Очистить мир",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+    {
+        return;
+    }
+    stop_molecule_interaction(window);
+    set_simulation_running(window, false);
+    scenario_steps.clear();
+    simulation_engine.clear();
+    reset_selection_after_deletion();
+    chart_samples.clear();
+    chart_recording = false;
+    invalidate_simulation_ui(window, true);
+}
+
+void show_object_management_menu(HWND window)
+{
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
+    {
+        MessageBoxW(window, L"Не удалось открыть меню удаления.",
+            L"Объекты", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const bool ready =
+        AppendMenuW(menu, MF_STRING, menu_delete_selected_particles,
+            L"Удалить выделенные частицы") &&
+        AppendMenuW(menu, MF_STRING, menu_delete_all_particles,
+            L"Удалить все частицы") &&
+        AppendMenuW(menu, MF_STRING, menu_delete_all_walls,
+            L"Удалить все стены") &&
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
+        AppendMenuW(menu, MF_STRING, menu_clear_world,
+            L"Очистить весь мир…");
+    if (!ready)
+    {
+        DestroyMenu(menu);
+        MessageBoxW(window, L"Не удалось создать меню удаления.",
+            L"Объекты", MB_OK | MB_ICONERROR);
+        return;
+    }
+    RECT client_area{};
+    GetClientRect(window, &client_area);
+    const RECT button = tools_panel_button_area(client_area, 13);
+    POINT position{button.left, button.bottom};
+    ClientToScreen(window, &position);
+    SetForegroundWindow(window);
+    const UINT command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        position.x, position.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    if (command == menu_delete_selected_particles)
+    {
+        remove_selected_particles(window);
+    }
+    else if (command == menu_delete_all_particles)
+    {
+        delete_all_particles(window);
+    }
+    else if (command == menu_delete_all_walls)
+    {
+        if (!simulation_engine.walls().empty() &&
+            MessageBoxW(window, L"Удалить все стены?", L"Удалить стены",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
+        {
+            simulation_engine.clear_walls();
+            invalidate_simulation_ui(window, true);
+        }
+    }
+    else if (command == menu_clear_world)
+    {
+        clear_entire_world(window);
+    }
 }
 
 std::vector<std::size_t> experiment_targets()
@@ -5304,6 +5653,16 @@ bool create_square_lattice(HWND window, std::size_t count,
     const std::size_t rows = (count + columns - 1) / columns;
     const double spacing = side /
         static_cast<double>((std::max)(columns, rows));
+    const double minimum_spacing = 2.0 *
+        element_display_radius(selected_element_number);
+    if (count > 1 && spacing < minimum_spacing)
+    {
+        MessageBoxW(window,
+            L"Клетки решётки слишком тесные для выбранного элемента. "
+            L"Нарисуйте квадрат больше или уменьшите число частиц.",
+            L"Частицы пересекаются", MB_OK | MB_ICONWARNING);
+        return false;
+    }
     const double end_x = start.x + (dx < 0.0 ? -side : side);
     const double end_y = start.y + (dy < 0.0 ? -side : side);
     const double center_x = (start.x + end_x) * 0.5;
@@ -5456,7 +5815,7 @@ void update_scenario(HWND window, double elapsed)
             scenario_steps[active_scenario_step].targets)
         {
             if (target < simulation_engine.particles().size() &&
-                !simulation_engine.set_external_force(target, Vec3{}))
+                !simulation_engine.set_transient_force(target, Vec3{}))
             {
                 MessageBoxW(window,
                     L"Не удалось переключить силу сценария.",
@@ -5502,7 +5861,7 @@ void update_scenario(HWND window, double elapsed)
         for (const std::size_t target : step.targets)
         {
             if (target < simulation_engine.particles().size() &&
-                !simulation_engine.set_external_force(target, step.force))
+                !simulation_engine.set_transient_force(target, step.force))
             {
                 MessageBoxW(window,
                     L"Не удалось применить силу шага сценария.",
@@ -5526,7 +5885,7 @@ void stop_scenario(HWND window)
             scenario_steps[active_scenario_step].targets)
         {
             if (target < simulation_engine.particles().size() &&
-                !simulation_engine.set_external_force(target, Vec3{}))
+                !simulation_engine.set_transient_force(target, Vec3{}))
             {
                 release_failed = true;
             }
@@ -5797,7 +6156,8 @@ void toggle_dimension_mode(HWND window)
     {
         camera_state.yaw = saved_3d_camera ? saved_3d_yaw : -pi / 4.0;
         camera_state.pitch = saved_3d_camera ? saved_3d_pitch : pi / 3.0;
-        molecule_placement_height = molecule_radius;
+        molecule_placement_height =
+            element_display_radius(selected_element_number);
     }
     invalidate_simulation_ui(window, true);
 }
@@ -5816,6 +6176,35 @@ void place_molecule(HWND window, POINT position)
     if (!screen_to_plane(client_area, position, placement_z, world_position))
     {
         return;
+    }
+    const elements::Element* element =
+        elements::find(selected_element_number);
+    if (element == nullptr)
+    {
+        MessageBoxW(window, L"Выбранный элемент недоступен.",
+            L"Создание атома", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const double sigma = element_model_sigma(*element);
+    constexpr double contact_scale = 1.122462048309373;
+    for (const simulation::Particle& particle :
+        simulation_engine.particles())
+    {
+        const double dx = world_position.x - particle.position.x;
+        const double dy = world_position.y - particle.position.y;
+        const double dz = simulation_engine.config().two_dimensional
+            ? 0.0 : world_position.z - particle.position.z;
+        const double minimum_distance =
+            0.5 * (sigma + particle.sigma) * contact_scale;
+        if (dx * dx + dy * dy + dz * dz <
+            minimum_distance * minimum_distance)
+        {
+            MessageBoxW(window,
+                L"В этом месте атом пересечётся с уже существующей частицей. "
+                L"Выберите свободное место.",
+                L"Частицы пересекаются", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
     }
     const std::size_t particle_index =
         simulation_engine.add_particle(world_position);
@@ -6149,7 +6538,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         }
         if (w_param == VK_ESCAPE && (molecule_tool_active || bond_tool_active ||
                 molecular_tool != MolecularTool::select ||
-                square_lattice_dragging || wall_tool_active ||
+                square_lattice_dragging || lasso_dragging || wall_tool_active ||
                 wall_dragging))
         {
             if (square_lattice_dragging)
@@ -6163,7 +6552,14 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 wall_dragging = false;
                 ReleaseCapture();
             }
+            if (lasso_dragging)
+            {
+                lasso_dragging = false;
+                lasso_points.clear();
+                ReleaseCapture();
+            }
             wall_tool_active = false;
+            molecular_tool = MolecularTool::select;
             set_molecule_tool(window, false);
             return 0;
         }
@@ -6390,6 +6786,19 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         {
             InvalidateRect(window, &area, FALSE);
         }
+        else if (lasso_dragging)
+        {
+            if (lasso_points.empty() ||
+                std::abs(position.x - lasso_points.back().x) +
+                    std::abs(position.y - lasso_points.back().y) >= 3)
+            {
+                if (lasso_points.size() < 10000)
+                {
+                    lasso_points.push_back(position);
+                }
+            }
+            InvalidateRect(window, &area, FALSE);
+        }
         else if (square_lattice_dragging)
         {
             Vec3 world_position{};
@@ -6467,6 +6876,28 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
     if (message == WM_LBUTTONUP && molecule_dragging)
     {
         stop_molecule_interaction(window);
+        ReleaseCapture();
+        return 0;
+    }
+
+    if (message == WM_LBUTTONUP && lasso_dragging)
+    {
+        RECT client_area{};
+        GetClientRect(window, &client_area);
+        const POINT position{
+            static_cast<short>(LOWORD(l_param)),
+            static_cast<short>(HIWORD(l_param))};
+        if (lasso_points.empty() ||
+            std::abs(position.x - lasso_points.back().x) +
+                std::abs(position.y - lasso_points.back().y) >= 3)
+        {
+            if (lasso_points.size() < 10000)
+            {
+                lasso_points.push_back(position);
+            }
+        }
+        lasso_dragging = false;
+        finish_lasso_selection(window, client_area);
         ReleaseCapture();
         return 0;
     }
@@ -6579,8 +7010,18 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         time_slider_dragging = false;
         const bool cancelled_lattice = square_lattice_dragging;
         const bool cancelled_wall = wall_dragging;
+        const bool cancelled_lasso = lasso_dragging;
         square_lattice_dragging = false;
         wall_dragging = false;
+        lasso_dragging = false;
+        if (cancelled_lasso)
+        {
+            lasso_points.clear();
+            RECT client_area{};
+            GetClientRect(window, &client_area);
+            const RECT area = scene_area(client_area);
+            InvalidateRect(window, &area, FALSE);
+        }
         if (cancelled_lattice)
         {
             square_lattice_for_scenario = false;
@@ -6655,7 +7096,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         if (tools_panel_visible)
         {
             const int row_count =
-                workspace_page == WorkspacePage::objects ? 12 :
+                workspace_page == WorkspacePage::objects ? 16 :
                 workspace_page == WorkspacePage::settings ? 11 :
                 workspace_page == WorkspacePage::dynamics ? 7 :
                 workspace_page == WorkspacePage::experiments ? 8 : 0;
@@ -6870,6 +7311,29 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 case 11:
                     show_periodic_table(window);
                     break;
+                case 12:
+                    molecular_tool =
+                        molecular_tool == MolecularTool::lasso_select
+                        ? MolecularTool::select
+                        : MolecularTool::lasso_select;
+                    molecule_tool_active = false;
+                    bond_tool_active = false;
+                    wall_tool_active = false;
+                    square_lattice_dragging = false;
+                    square_lattice_for_scenario = false;
+                    lasso_dragging = false;
+                    lasso_points.clear();
+                    invalidate_simulation_ui(window, true);
+                    break;
+                case 13:
+                    show_object_management_menu(window);
+                    break;
+                case 14:
+                    add_constant_force_to_selection(window);
+                    break;
+                case 15:
+                    clear_constant_force_from_selection(window);
+                    break;
                 default:
                     break;
                 }
@@ -6906,6 +7370,16 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             return 0;
         }
         const RECT area = scene_area(client_area);
+        if (molecular_tool == MolecularTool::lasso_select &&
+            PtInRect(&area, position))
+        {
+            lasso_points.clear();
+            lasso_points.push_back(position);
+            lasso_dragging = true;
+            SetCapture(window);
+            InvalidateRect(window, &area, FALSE);
+            return 0;
+        }
         if (bond_tool_active && PtInRect(&area, position))
         {
             select_bond_endpoint(window, position);
@@ -7017,7 +7491,7 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
             {
                 molecule_placement_height = (std::clamp)(
                     molecule_placement_height + wheel_steps * 0.25,
-                    molecule_radius, 50.0);
+                    element_display_radius(selected_element_number), 50.0);
                 InvalidateRect(window, &area, FALSE);
                 const RECT button_area = molecule_tool_area(client_area);
                 InvalidateRect(window, &button_area, FALSE);
