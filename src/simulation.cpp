@@ -294,7 +294,7 @@ private:
     {
         const TreeNode& node = nodes_[node_index];
         const Particle& target = particles_[target_index];
-        if (std::abs(node.total_charge) < 1e-15 || node.absolute_charge == 0.0)
+        if (node.absolute_charge == 0.0)
         {
             return true;
         }
@@ -333,6 +333,7 @@ private:
         const double distance = std::sqrt(distance_squared);
         const double node_width = node.half_size * 2.0;
         if (distance_squared > minimum_squared_distance &&
+            std::abs(node.total_charge) >= node.absolute_charge * (1.0 - 1e-12) &&
             !contains(node, target.position) &&
             node_width / distance < theta_)
         {
@@ -392,7 +393,7 @@ std::size_t Engine::add_particle(Vec3 position)
     return particles_.size() - 1;
 }
 
-bool Engine::add_bond(Bond bond, std::string& error)
+bool Engine::add_bond(Bond bond, std::string& error, bool infer_angles)
 {
     if (bond.first >= particles_.size() || bond.second >= particles_.size() ||
         bond.first == bond.second || !std::isfinite(bond.equilibrium_length) ||
@@ -414,6 +415,11 @@ bool Engine::add_bond(Bond bond, std::string& error)
 
     const std::vector<Bond> existing_bonds = bonds_;
     bonds_.push_back(bond);
+    if (!infer_angles)
+    {
+        forces_initialized_ = false;
+        return true;
+    }
     for (const Bond& existing : existing_bonds)
     {
         std::size_t center = 0;
@@ -767,6 +773,26 @@ void Engine::invalidate_neighbors()
 void Engine::invalidate_forces()
 {
     forces_initialized_ = false;
+}
+
+bool Engine::refresh_state(std::string& error)
+{
+    if (!validate_config(error))
+    {
+        return false;
+    }
+    if (forces_initialized_ && !force_configuration_matches())
+    {
+        forces_initialized_ = false;
+    }
+    if (!compute_forces(error))
+    {
+        return false;
+    }
+    forces_initialized_ = true;
+    force_config_snapshot_ = config_;
+    update_metrics();
+    return true;
 }
 
 bool Engine::validate_config(std::string& error) const
@@ -1420,7 +1446,7 @@ void Engine::apply_walls(const std::vector<Vec3>& previous_positions)
                     (particle.position.x - wall.start.x) * nx +
                     (particle.position.y - wall.start.y) * ny;
                 const double side = previous_side < 0.0 ? -1.0 : 1.0;
-                const bool crossed = previous_side * current_side <= 0.0;
+                const bool crossed = previous_side * current_side < 0.0;
                 const double denominator = previous_side - current_side;
                 double hit_x = particle.position.x;
                 double hit_y = particle.position.y;
@@ -1482,40 +1508,226 @@ void Engine::apply_walls(const std::vector<Vec3>& previous_positions)
                     particle.position.x = closest_x + radius * normal_x;
                     particle.position.y = closest_y + radius * normal_y;
                 }
-                const double normal_velocity =
-                    particle.velocity.x * nx + particle.velocity.y * ny;
-                if (normal_velocity * correction_side < 0.0 || hit_segment)
+                const double contact_fraction = (std::clamp)(
+                    ((particle.position.x - wall.start.x) * dx +
+                        (particle.position.y - wall.start.y) * dy) /
+                        length_squared, 0.0, 1.0);
+                const double contact_x =
+                    wall.start.x + contact_fraction * dx;
+                const double contact_y =
+                    wall.start.y + contact_fraction * dy;
+                double normal_x = particle.position.x - contact_x;
+                double normal_y = particle.position.y - contact_y;
+                const double normal_length =
+                    std::hypot(normal_x, normal_y);
+                if (normal_length > 1e-12)
                 {
-                    particle.velocity.x -=
-                        2.0 * normal_velocity * nx;
-                    particle.velocity.y -=
-                        2.0 * normal_velocity * ny;
+                    normal_x /= normal_length;
+                    normal_y /= normal_length;
+                }
+                else
+                {
+                    normal_x = correction_side * nx;
+                    normal_y = correction_side * ny;
+                }
+                const double normal_velocity =
+                    particle.velocity.x * normal_x +
+                    particle.velocity.y * normal_y;
+                if (normal_velocity < 0.0)
+                {
+                    const double impulse_scale =
+                        (1.0 + config_.restitution) * normal_velocity;
+                    particle.velocity.x -= impulse_scale * normal_x;
+                    particle.velocity.y -= impulse_scale * normal_y;
                 }
             }
             else if (!config_.two_dimensional && wall.plane)
             {
-                const double plane_z = wall.start.z;
-                const double previous_distance = previous.z - plane_z;
-                const double current_distance =
-                    particle.position.z - plane_z;
-                const bool crossed =
-                    previous_distance * current_distance <= 0.0;
-                const double side = previous_distance < 0.0 ? -1.0 : 1.0;
-                const bool inside =
-                    particle.position.x >=
-                            (std::min)(wall.start.x, wall.end.x) - radius &&
-                    particle.position.x <=
-                            (std::max)(wall.start.x, wall.end.x) + radius &&
-                    particle.position.y >=
-                            (std::min)(wall.start.y, wall.end.y) - radius &&
-                    particle.position.y <=
-                            (std::max)(wall.start.y, wall.end.y) + radius;
-                if ((crossed || std::abs(current_distance) < radius) && inside)
-                {
-                    particle.position.z = plane_z + side * radius;
-                    if (particle.velocity.z * side < 0.0 || crossed)
+                const double minimum_x =
+                    (std::min)(wall.start.x, wall.end.x);
+                const double maximum_x =
+                    (std::max)(wall.start.x, wall.end.x);
+                const double minimum_y =
+                    (std::min)(wall.start.y, wall.end.y);
+                const double maximum_y =
+                    (std::max)(wall.start.y, wall.end.y);
+                const Vec3 displacement = particle.position - previous;
+                std::array<double, 6> intervals{0.0, 1.0};
+                std::size_t interval_count = 2;
+                const auto add_interval = [&intervals, &interval_count](
+                    double start, double delta, double boundary) {
+                    if (std::abs(delta) < 1e-12)
                     {
-                        particle.velocity.z = -particle.velocity.z;
+                        return;
+                    }
+                    const double time = (boundary - start) / delta;
+                    if (time > 0.0 && time < 1.0)
+                    {
+                        intervals[interval_count++] = time;
+                    }
+                };
+                add_interval(previous.x, displacement.x, minimum_x);
+                add_interval(previous.x, displacement.x, maximum_x);
+                add_interval(previous.y, displacement.y, minimum_y);
+                add_interval(previous.y, displacement.y, maximum_y);
+                std::sort(intervals.begin(),
+                    intervals.begin() + interval_count);
+
+                double contact_time = -1.0;
+                const double radius_squared = radius * radius;
+                const auto distance_squared = [&](double time) {
+                    const Vec3 center =
+                        previous + displacement * time;
+                    const double closest_x = (std::clamp)(
+                        center.x, minimum_x, maximum_x);
+                    const double closest_y = (std::clamp)(
+                        center.y, minimum_y, maximum_y);
+                    return (center.x - closest_x) *
+                            (center.x - closest_x) +
+                        (center.y - closest_y) *
+                            (center.y - closest_y) +
+                        (center.z - wall.start.z) *
+                            (center.z - wall.start.z);
+                };
+
+                if (distance_squared(0.0) <= radius_squared)
+                {
+                    contact_time = 0.0;
+                }
+                for (std::size_t interval = 0;
+                     interval + 1 < interval_count && contact_time < 0.0;
+                     ++interval)
+                {
+                    const double left = intervals[interval];
+                    const double right = intervals[interval + 1];
+                    const double middle = (left + right) * 0.5;
+                    const double middle_x =
+                        previous.x + displacement.x * middle;
+                    const double middle_y =
+                        previous.y + displacement.y * middle;
+                    double offset_x = 0.0;
+                    double slope_x = 0.0;
+                    double offset_y = 0.0;
+                    double slope_y = 0.0;
+                    if (middle_x < minimum_x)
+                    {
+                        offset_x = previous.x - minimum_x;
+                        slope_x = displacement.x;
+                    }
+                    else if (middle_x > maximum_x)
+                    {
+                        offset_x = previous.x - maximum_x;
+                        slope_x = displacement.x;
+                    }
+                    if (middle_y < minimum_y)
+                    {
+                        offset_y = previous.y - minimum_y;
+                        slope_y = displacement.y;
+                    }
+                    else if (middle_y > maximum_y)
+                    {
+                        offset_y = previous.y - maximum_y;
+                        slope_y = displacement.y;
+                    }
+
+                    const double offset_z = previous.z - wall.start.z;
+                    const double slope_z = displacement.z;
+                    const double quadratic =
+                        slope_x * slope_x + slope_y * slope_y +
+                        slope_z * slope_z;
+                    const double linear = 2.0 *
+                        (offset_x * slope_x + offset_y * slope_y +
+                            offset_z * slope_z);
+                    const double constant =
+                        offset_x * offset_x + offset_y * offset_y +
+                        offset_z * offset_z - radius_squared;
+                    const auto clearance = [quadratic, linear, constant](
+                        double time) {
+                        return quadratic * time * time +
+                            linear * time + constant;
+                    };
+                    const double minimum_time = quadratic > 0.0
+                        ? (std::clamp)(
+                            -linear / (2.0 * quadratic), left, right)
+                        : left;
+                    if (clearance(minimum_time) > 0.0)
+                    {
+                        continue;
+                    }
+
+                    double low = left;
+                    double high = minimum_time;
+                    if (clearance(low) <= 0.0)
+                    {
+                        contact_time = low;
+                    }
+                    else
+                    {
+                        for (unsigned int iteration = 0;
+                             iteration < 48; ++iteration)
+                        {
+                            const double middle_time = (low + high) * 0.5;
+                            if (clearance(middle_time) > 0.0)
+                            {
+                                low = middle_time;
+                            }
+                            else
+                            {
+                                high = middle_time;
+                            }
+                        }
+                        contact_time = high;
+                    }
+                }
+
+                if (contact_time >= 0.0)
+                {
+                    Vec3 contact_center =
+                        previous + displacement * contact_time;
+                    const Vec3 closest_point{
+                        (std::clamp)(contact_center.x, minimum_x, maximum_x),
+                        (std::clamp)(contact_center.y, minimum_y, maximum_y),
+                        wall.start.z};
+                    Vec3 normal = contact_center - closest_point;
+                    double contact_distance =
+                        std::sqrt(length_squared(normal));
+                    if (contact_distance > 1e-12)
+                    {
+                        normal = normal / contact_distance;
+                    }
+                    else
+                    {
+                        const double movement_length =
+                            std::sqrt(length_squared(displacement));
+                        normal = movement_length > 1e-12
+                            ? displacement / movement_length
+                            : Vec3{0.0, 0.0, 1.0};
+                    }
+
+                    if (contact_distance < radius)
+                    {
+                        contact_center += normal *
+                            (radius - contact_distance);
+                    }
+                    Vec3 remaining =
+                        particle.position - (previous +
+                            displacement * contact_time);
+                    const double remaining_normal = dot(remaining, normal);
+                    if (remaining_normal < 0.0)
+                    {
+                        remaining += normal *
+                            (-(1.0 + config_.restitution) *
+                                remaining_normal);
+                    }
+                    particle.position = contact_center + remaining;
+
+                    const double velocity_normal =
+                        dot(particle.velocity, normal);
+                    if (velocity_normal < 0.0)
+                    {
+                        particle.velocity += normal *
+                            (-(1.0 + config_.restitution) *
+                                velocity_normal);
                     }
                 }
             }
@@ -1751,6 +1963,92 @@ bool Engine::step(std::string& error)
     force_config_snapshot_ = config_;
     ++metrics_.steps;
     update_metrics();
+    return true;
+}
+
+bool Engine::matches_state(const Engine& other) const
+{
+    const auto same_vector = [](Vec3 left, Vec3 right) {
+        return left.x == right.x && left.y == right.y && left.z == right.z;
+    };
+    const auto& left_config = config_;
+    const auto& right_config = other.config_;
+    if (left_config.time_step != right_config.time_step ||
+        left_config.cutoff != right_config.cutoff ||
+        left_config.neighbor_skin != right_config.neighbor_skin ||
+        left_config.target_temperature != right_config.target_temperature ||
+        left_config.thermostat_rate != right_config.thermostat_rate ||
+        left_config.gravity_z != right_config.gravity_z ||
+        left_config.coulomb_constant != right_config.coulomb_constant ||
+        left_config.barnes_hut_theta != right_config.barnes_hut_theta ||
+        left_config.wall_stiffness != right_config.wall_stiffness ||
+        left_config.boundary_min != right_config.boundary_min ||
+        left_config.boundary_max != right_config.boundary_max ||
+        left_config.restitution != right_config.restitution ||
+        left_config.maximum_speed != right_config.maximum_speed ||
+        left_config.two_dimensional != right_config.two_dimensional ||
+        left_config.integrator != right_config.integrator ||
+        left_config.thermostat != right_config.thermostat ||
+        left_config.boundary_mode != right_config.boundary_mode ||
+        left_config.coulomb_solver != right_config.coulomb_solver ||
+        particles_.size() != other.particles_.size() ||
+        bonds_.size() != other.bonds_.size() ||
+        angles_.size() != other.angles_.size() ||
+        walls_.size() != other.walls_.size())
+    {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < particles_.size(); ++index)
+    {
+        const Particle& left = particles_[index];
+        const Particle& right = other.particles_[index];
+        if (!same_vector(left.position, right.position) ||
+            !same_vector(left.velocity, right.velocity) ||
+            !same_vector(left.force, right.force) ||
+            !same_vector(left.external_force, right.external_force) ||
+            !same_vector(left.transient_force, right.transient_force) ||
+            left.atomic_number != right.atomic_number ||
+            left.mass != right.mass || left.charge != right.charge ||
+            left.sigma != right.sigma || left.epsilon != right.epsilon ||
+            left.fixed != right.fixed)
+        {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < bonds_.size(); ++index)
+    {
+        const Bond& left = bonds_[index];
+        const Bond& right = other.bonds_[index];
+        if (left.first != right.first || left.second != right.second ||
+            left.equilibrium_length != right.equilibrium_length ||
+            left.stiffness != right.stiffness)
+        {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < angles_.size(); ++index)
+    {
+        const Angle& left = angles_[index];
+        const Angle& right = other.angles_[index];
+        if (left.first != right.first || left.center != right.center ||
+            left.third != right.third ||
+            left.equilibrium_radians != right.equilibrium_radians ||
+            left.stiffness != right.stiffness)
+        {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < walls_.size(); ++index)
+    {
+        const Wall& left = walls_[index];
+        const Wall& right = other.walls_[index];
+        if (!same_vector(left.start, right.start) ||
+            !same_vector(left.end, right.end) || left.plane != right.plane)
+        {
+            return false;
+        }
+    }
     return true;
 }
 

@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <condition_variable>
 
 void check(bool condition, int line)
 {
@@ -454,6 +457,63 @@ void test_barnes_hut_coulomb_path()
     }
 }
 
+void test_barnes_hut_neutral_system_matches_direct_solver()
+{
+    simulation::Engine barnes_hut_engine;
+    simulation::Engine direct_engine;
+    barnes_hut_engine.config().coulomb_solver =
+        simulation::CoulombSolver::barnes_hut;
+    direct_engine.config().coulomb_solver =
+        simulation::CoulombSolver::direct;
+
+    for (int index = 0; index < 32; ++index)
+    {
+        const double y = static_cast<double>((index / 4) % 4) * 0.25;
+        const double z = static_cast<double>(index / 16) * 0.25;
+        for (const int side : {-1, 1})
+        {
+            const double x = static_cast<double>(side) * 10.0 +
+                static_cast<double>(index % 4) * 0.25;
+            const double charge = side < 0 ? 1.0 : -1.0;
+            for (simulation::Engine* engine : {
+                     &barnes_hut_engine, &direct_engine})
+            {
+                const std::size_t particle =
+                    engine->add_particle({x, y, z});
+                assert(engine->set_particle_properties(
+                    particle, 1.0, charge, 0.1, 0.0, true));
+            }
+        }
+    }
+
+    std::string error;
+    assert(barnes_hut_engine.step(error));
+    assert(direct_engine.step(error));
+    const double potential_energy_error =
+        barnes_hut_engine.metrics().potential_energy -
+        direct_engine.metrics().potential_energy;
+    assert(std::abs(potential_energy_error) <=
+        std::abs(direct_engine.metrics().potential_energy) * 0.1);
+    for (std::size_t index = 0;
+         index < barnes_hut_engine.particles().size(); ++index)
+    {
+        const simulation::Vec3 barnes_hut_force =
+            barnes_hut_engine.particles()[index].force;
+        const simulation::Vec3 direct_force =
+            direct_engine.particles()[index].force;
+        const double error_squared =
+            std::pow(barnes_hut_force.x - direct_force.x, 2.0) +
+            std::pow(barnes_hut_force.y - direct_force.y, 2.0) +
+            std::pow(barnes_hut_force.z - direct_force.z, 2.0);
+        const double direct_force_squared =
+            direct_force.x * direct_force.x +
+            direct_force.y * direct_force.y +
+            direct_force.z * direct_force.z;
+        assert(direct_force_squared > 1e-12);
+        assert(error_squared <= direct_force_squared * 0.01);
+    }
+}
+
 void test_dimension_mode_constrains_particles_to_xy()
 {
     simulation::Engine engine;
@@ -493,6 +553,61 @@ void test_two_dimensional_line_wall_reflects_swept_particle()
     assert(engine.particles()[particle].velocity.z == 0.0);
 }
 
+void test_wall_restitution_scales_reflected_velocity()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    engine.config().restitution = 0.25;
+    assert(engine.set_dimension_mode(true));
+    const std::size_t particle =
+        engine.add_particle({-1.0, 0.0, 0.0});
+    set_neutral_lj(engine, particle);
+    assert(engine.set_velocity(particle, {200.0, 0.0, 0.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{0.0, -2.0, 0.0}, {0.0, 2.0, 0.0}, false}, error));
+
+    assert(engine.step(error));
+    assert(near(engine.particles()[particle].velocity.x, -50.0));
+}
+
+void test_two_dimensional_wall_does_not_reflect_particle_moving_away()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    assert(engine.set_dimension_mode(true));
+    const std::size_t particle =
+        engine.add_particle({0.0, 0.0, 0.0});
+    assert(engine.set_particle_properties(particle, 1.0, 0.0, 0.1, 0.0, false));
+    assert(engine.set_velocity(particle, {1.0, 0.0, 0.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{0.0, -2.0, 0.0}, {0.0, 2.0, 0.0}, false}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].velocity.x > 0.0);
+    assert(engine.particles()[particle].position.x > 0.0);
+}
+
+void test_two_dimensional_wall_endpoint_uses_radial_contact_normal()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    engine.config().restitution = 1.0;
+    assert(engine.set_dimension_mode(true));
+    const std::size_t particle =
+        engine.add_particle({0.5, 1.5, 0.0});
+    assert(engine.set_particle_properties(particle, 1.0, 0.0, 0.1, 0.0, false));
+    assert(engine.set_velocity(particle, {-47.0, -46.0, 0.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{0.0, -1.0, 0.0}, {0.0, 1.0, 0.0}, false}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].velocity.x > 0.0);
+    assert(engine.particles()[particle].velocity.y > 0.0);
+}
+
 void test_three_dimensional_plane_wall_reflects_swept_particle()
 {
     simulation::Engine engine;
@@ -510,6 +625,94 @@ void test_three_dimensional_plane_wall_reflects_swept_particle()
     assert(engine.particles()[particle].velocity.z < 0.0);
 }
 
+void test_three_dimensional_wall_does_not_reflect_particle_moving_away()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle =
+        engine.add_particle({0.0, 0.0, 0.0});
+    assert(engine.set_particle_properties(particle, 1.0, 0.0, 0.1, 0.0, false));
+    assert(engine.set_velocity(particle, {0.0, 0.0, 1.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{-2.0, -2.0, 0.0}, {2.0, 2.0, 0.0}, true}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].velocity.z > 0.0);
+    assert(engine.particles()[particle].position.z > 0.0);
+}
+
+void test_three_dimensional_wall_restitution_scales_reflected_velocity()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    engine.config().restitution = 0.25;
+    const std::size_t particle =
+        engine.add_particle({0.0, 0.0, -1.0});
+    set_neutral_lj(engine, particle);
+    assert(engine.set_velocity(particle, {0.0, 0.0, 200.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{-2.0, -2.0, 0.0}, {2.0, 2.0, 0.0}, true}, error));
+
+    assert(engine.step(error));
+    assert(near(engine.particles()[particle].velocity.z, -50.0));
+}
+
+void test_three_dimensional_plane_wall_reflects_diagonal_sweep()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle =
+        engine.add_particle({-2.0, -2.0, -1.0});
+    set_neutral_lj(engine, particle);
+    assert(engine.set_velocity(particle, {400.0, 400.0, 200.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{-1.0, -1.0, 0.0}, {1.0, 1.0, 0.0}, true}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].position.z < 0.0);
+    assert(engine.particles()[particle].velocity.z < 0.0);
+}
+
+void test_three_dimensional_plane_wall_does_not_hit_outside_rounded_corner()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle =
+        engine.add_particle({1.04, 1.04, -1.0});
+    assert(engine.set_particle_properties(particle, 1.0, 0.0, 0.1, 0.0, false));
+    assert(engine.set_velocity(particle, {0.0, 0.0, 200.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{-1.0, -1.0, 0.0}, {1.0, 1.0, 0.0}, true}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].velocity.z > 0.0);
+    assert(engine.particles()[particle].position.z > 0.0);
+}
+
+void test_three_dimensional_plane_wall_hits_near_rounded_corner()
+{
+    simulation::Engine engine;
+    engine.config().time_step = 0.01;
+    const std::size_t particle =
+        engine.add_particle({1.03, 1.03, -1.0});
+    assert(engine.set_particle_properties(particle, 1.0, 0.0, 0.1, 0.0, false));
+    assert(engine.set_velocity(particle, {0.0, 0.0, 200.0}));
+    std::string error;
+    assert(engine.add_wall(
+        {{-1.0, -1.0, 0.0}, {1.0, 1.0, 0.0}, true}, error));
+
+    assert(engine.step(error));
+    assert(engine.particles()[particle].velocity.x > 0.0);
+    assert(engine.particles()[particle].velocity.y > 0.0);
+    assert(engine.particles()[particle].velocity.z > 0.0);
+    assert(engine.particles()[particle].position.x > 1.03);
+    assert(engine.particles()[particle].position.y > 1.03);
+}
+
 void test_particle_element_identity()
 {
     simulation::Engine engine;
@@ -521,6 +724,83 @@ void test_particle_element_identity()
     assert(!engine.set_particle_element(particle, 119));
     assert(!engine.set_particle_element(particle + 1, 1));
 }
+
+void test_engine_state_match_detects_simulation_changes()
+{
+    simulation::Engine original;
+    const std::size_t particle = original.add_particle({1.0, 2.0, 3.0});
+    simulation::Engine snapshot = original;
+    assert(original.matches_state(snapshot));
+
+    assert(snapshot.set_velocity(particle, {1.0, 0.0, 0.0}));
+    assert(!original.matches_state(snapshot));
+    assert(original.set_velocity(particle, {1.0, 0.0, 0.0}));
+    assert(original.matches_state(snapshot));
+
+    snapshot.config().time_step = 0.005;
+    assert(!original.matches_state(snapshot));
+}
+
+void test_background_step_uses_an_isolated_engine_snapshot()
+{
+    simulation::Engine original;
+    original.config().time_step = 0.001;
+    for (std::size_t index = 0; index < 512; ++index)
+    {
+        const std::size_t particle = original.add_particle(
+            {static_cast<double>(index) * 2.0, 0.0, 0.0});
+        set_neutral_lj(original, particle);
+    }
+    assert(original.set_velocity(0, {1.0, 0.0, 0.0}));
+
+    simulation::Engine baseline = original;
+    simulation::Engine worker_engine = baseline;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool worker_started = false;
+    bool succeeded = false;
+    std::string error;
+    std::thread worker([&] {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            worker_started = true;
+        }
+        condition.notify_one();
+        succeeded = worker_engine.step(error);
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [&] { return worker_started; });
+    }
+    assert(original.set_position(0, {-10.0, 0.0, 0.0}));
+    worker.join();
+
+    assert(succeeded);
+    assert(!original.matches_state(baseline));
+    assert(worker_engine.matches_state(baseline) == false);
+    assert(original.particles()[0].position.x == -10.0);
+}
+
+void test_background_step_failure_keeps_the_source_state_unchanged()
+{
+    simulation::Engine original;
+    original.add_particle({0.0, 0.0, 0.0});
+    original.config().time_step = 0.1;
+    simulation::Engine baseline = original;
+    simulation::Engine worker_engine = baseline;
+    bool succeeded = true;
+    std::string error;
+    std::thread worker([&] {
+        succeeded = worker_engine.step(error);
+    });
+    worker.join();
+
+    assert(!succeeded);
+    assert(!error.empty());
+    assert(original.matches_state(baseline));
+}
+
 }
 
 int main()
@@ -545,10 +825,22 @@ int main()
     test_soft_wall_force_and_overlapping_particle_resolution();
     test_reflective_boundary_and_thermostat_modes();
     test_barnes_hut_coulomb_path();
+    test_barnes_hut_neutral_system_matches_direct_solver();
     test_dimension_mode_constrains_particles_to_xy();
     test_two_dimensional_line_wall_reflects_swept_particle();
+    test_wall_restitution_scales_reflected_velocity();
+    test_two_dimensional_wall_does_not_reflect_particle_moving_away();
+    test_two_dimensional_wall_endpoint_uses_radial_contact_normal();
     test_three_dimensional_plane_wall_reflects_swept_particle();
+    test_three_dimensional_wall_does_not_reflect_particle_moving_away();
+    test_three_dimensional_wall_restitution_scales_reflected_velocity();
+    test_three_dimensional_plane_wall_reflects_diagonal_sweep();
+    test_three_dimensional_plane_wall_does_not_hit_outside_rounded_corner();
+    test_three_dimensional_plane_wall_hits_near_rounded_corner();
     test_particle_element_identity();
+    test_engine_state_match_detects_simulation_changes();
+    test_background_step_uses_an_isolated_engine_snapshot();
+    test_background_step_failure_keeps_the_source_state_unchanged();
     std::cout << "Simulation tests passed.\n";
     return 0;
 }

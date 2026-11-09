@@ -121,7 +121,7 @@ class Engine
 {
 public:
     std::size_t add_particle(Vec3 position);
-    bool add_bond(Bond bond, std::string& error);
+    bool add_bond(Bond bond, std::string& error, bool infer_angles = true);
     bool add_angle(Angle angle, std::string& error);
     bool add_wall(Wall wall, std::string& error);
     bool set_dimension_mode(bool two_dimensional);
@@ -141,6 +141,8 @@ public:
     void invalidate_forces();
 
     bool step(std::string& error);
+    bool refresh_state(std::string& error);
+    bool matches_state(const Engine& other) const;
     const std::vector<Particle>& particles() const;
     const std::vector<Bond>& bonds() const;
     const std::vector<Angle>& angles() const;

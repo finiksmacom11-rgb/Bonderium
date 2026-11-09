@@ -6,15 +6,23 @@ param(
     [string]$AppPath,
 
     [Parameter(Mandatory = $true)]
-    [int]$ProcessId
+    [int]$ProcessId,
+
+    [switch]$SuppressErrorDialog
 )
 
 $ErrorActionPreference = "Stop"
 $stagingDirectory = Join-Path $env:TEMP ("Bonderium-update-" + [guid]::NewGuid().ToString("N"))
 $replacementPath = "$AppPath.new"
-$backupPath = "$AppPath.bak"
 $updaterPath = Join-Path (Split-Path -Parent $AppPath) "updater.ps1"
-$appReplaced = $false
+$replacementUpdaterPath = "$updaterPath.new"
+$backupSuffix = "." + [guid]::NewGuid().ToString("N") + ".bak"
+$backupPath = "$AppPath$backupSuffix"
+$updaterBackupPath = "$updaterPath$backupSuffix"
+$appBackedUp = $false
+$appInstalled = $false
+$updaterBackedUp = $false
+$updaterInstalled = $false
 
 try {
     Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
@@ -23,38 +31,74 @@ try {
 
     $newExecutable = Join-Path $stagingDirectory "Bonderium.exe"
     $newUpdater = Join-Path $stagingDirectory "updater.ps1"
-    if (-not (Test-Path -LiteralPath $newExecutable) -or -not (Test-Path -LiteralPath $newUpdater)) {
+    if (-not (Test-Path -LiteralPath $newExecutable) -or
+        -not (Test-Path -LiteralPath $newUpdater) -or
+        -not (Test-Path -LiteralPath $AppPath) -or
+        -not (Test-Path -LiteralPath $updaterPath)) {
         throw "The release archive does not contain the application files."
     }
 
     Copy-Item -LiteralPath $newExecutable -Destination $replacementPath -Force
-    if (Test-Path -LiteralPath $backupPath) {
-        Remove-Item -LiteralPath $backupPath -Force
-    }
+    Copy-Item -LiteralPath $newUpdater -Destination $replacementUpdaterPath -Force
     [System.IO.File]::Move($AppPath, $backupPath)
-    try {
-        [System.IO.File]::Move($replacementPath, $AppPath)
-        $appReplaced = $true
-        Copy-Item -LiteralPath $newUpdater -Destination $updaterPath -Force
-    }
-    catch {
-        if (Test-Path -LiteralPath $AppPath) {
-            Remove-Item -LiteralPath $AppPath -Force
-        }
-        [System.IO.File]::Move($backupPath, $AppPath)
-        throw
-    }
-
-    Remove-Item -LiteralPath $backupPath -Force
+    $appBackedUp = $true
+    [System.IO.File]::Move($updaterPath, $updaterBackupPath)
+    $updaterBackedUp = $true
+    [System.IO.File]::Move($replacementPath, $AppPath)
+    $appInstalled = $true
+    [System.IO.File]::Move($replacementUpdaterPath, $updaterPath)
+    $updaterInstalled = $true
     Start-Process -FilePath $AppPath
+    Remove-Item -LiteralPath $backupPath, $updaterBackupPath -Force -ErrorAction SilentlyContinue
 }
 catch {
-    if (-not $appReplaced -and (Test-Path -LiteralPath $replacementPath)) {
-        Remove-Item -LiteralPath $replacementPath -Force
+    $updateError = $_.Exception.Message
+    $rollbackErrors = @()
+
+    if ($updaterInstalled -and (Test-Path -LiteralPath $updaterPath)) {
+        try {
+            Remove-Item -LiteralPath $updaterPath -Force
+        }
+        catch {
+            $rollbackErrors += "Could not remove the updated updater: $($_.Exception.Message)"
+        }
     }
+    if ($updaterBackedUp -and (Test-Path -LiteralPath $updaterBackupPath)) {
+        try {
+            [System.IO.File]::Move($updaterBackupPath, $updaterPath)
+        }
+        catch {
+            $rollbackErrors += "Could not restore the previous updater: $($_.Exception.Message)"
+        }
+    }
+    if ($appInstalled -and (Test-Path -LiteralPath $AppPath)) {
+        try {
+            Remove-Item -LiteralPath $AppPath -Force
+        }
+        catch {
+            $rollbackErrors += "Could not remove the updated application: $($_.Exception.Message)"
+        }
+    }
+    if ($appBackedUp -and (Test-Path -LiteralPath $backupPath)) {
+        try {
+            [System.IO.File]::Move($backupPath, $AppPath)
+        }
+        catch {
+            $rollbackErrors += "Could not restore the previous application: $($_.Exception.Message)"
+        }
+    }
+
+    $details = $updateError
+    if ($rollbackErrors.Count -gt 0) {
+        $details += "`n`nRollback warnings:`n" + ($rollbackErrors -join "`n")
+    }
+    if ($SuppressErrorDialog) {
+        throw $details
+    }
+
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.MessageBox]::Show(
-        "The update could not be installed. Start Bonderium and try again.`n`n$($_.Exception.Message)",
+        "The update could not be installed. Start Bonderium and try again.`n`n$details",
         "Bonderium",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error
@@ -66,5 +110,11 @@ finally {
     }
     if (Test-Path -LiteralPath $stagingDirectory) {
         Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $replacementPath) {
+        Remove-Item -LiteralPath $replacementPath -Force
+    }
+    if (Test-Path -LiteralPath $replacementUpdaterPath) {
+        Remove-Item -LiteralPath $replacementUpdaterPath -Force
     }
 }

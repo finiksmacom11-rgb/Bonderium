@@ -1,18 +1,28 @@
 #include <windows.h>
 #include <GL/gl.h>
+#include <commdlg.h>
 #include <psapi.h>
 #include <shellapi.h>
 
 #include "elements.h"
+#include "physics_calculator.h"
+#include "project_file.h"
 #include "simulation.h"
 #include "updater.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
+#include <memory>
+#include <new>
 #include <random>
 #include <string>
 #include <utility>
@@ -29,6 +39,8 @@ constexpr wchar_t detached_settings_class_name[] =
 constexpr wchar_t chart_window_class_name[] = L"BonderiumChartWindow";
 constexpr wchar_t element_table_window_class_name[] =
     L"BonderiumElementTable";
+constexpr wchar_t calculator_window_class_name[] =
+    L"BonderiumCalculatorWindow";
 
 constexpr int toolbar_height = 62;
 constexpr int footer_height = 116;
@@ -52,7 +64,6 @@ constexpr UINT_PTR simulation_timer_id = 3;
 constexpr UINT_PTR motion_timer_interval_ms = 16;
 constexpr UINT simulation_timer_interval_ms = 8;
 constexpr unsigned int maximum_catch_up_steps = 12;
-constexpr double simulation_work_budget_ms = 4.0;
 constexpr double minimum_time_flow_factor = 0.25;
 constexpr double maximum_time_flow_factor = 4.0;
 constexpr std::size_t chart_sample_capacity = 3000;
@@ -100,9 +111,10 @@ enum class WorkspacePage
     objects,
     thermodynamics,
     dynamics,
-    quantum,
+    model_info,
     settings,
-    experiments
+    experiments,
+    calculator
 };
 
 struct VisualPalette
@@ -170,7 +182,9 @@ enum GraphicsMenuCommand : UINT
     menu_panel_tools,
     menu_separate_interface = 60,
     menu_open_detached_settings,
-    menu_open_charts
+    menu_open_charts,
+    menu_save_project = 80,
+    menu_open_project
 };
 
 enum class InteractionTool
@@ -263,6 +277,15 @@ struct Telemetry
     ULONGLONG simulation_sample_started_at = 0;
 };
 
+struct SimulationWorkerContext
+{
+    std::unique_ptr<simulation::Engine> engine;
+    std::atomic<bool> finished{false};
+    bool succeeded = false;
+    std::string error;
+    double elapsed_ms = 0.0;
+};
+
 struct ChartSample
 {
     double time = 0.0;
@@ -283,6 +306,10 @@ CameraState camera_state;
 Telemetry telemetry;
 LARGE_INTEGER performance_frequency{};
 simulation::Engine simulation_engine;
+HANDLE simulation_worker_handle = nullptr;
+SimulationWorkerContext* simulation_worker_context = nullptr;
+std::unique_ptr<simulation::Engine> simulation_worker_baseline;
+bool simulation_worker_discard_result = false;
 HDC window_device_context = nullptr;
 HGLRC open_gl_context = nullptr;
 GLuint sphere_display_lists[3]{};
@@ -354,6 +381,7 @@ std::uint64_t pending_bond_molecule_id = 0;
 bool simulation_running = false;
 double simulation_time_accumulator = 0.0;
 ULONGLONG last_simulation_tick = 0;
+
 double molecule_placement_height = molecule_radius;
 bool pointer_over_scene = false;
 bool orbit_dragging = false;
@@ -367,6 +395,19 @@ POINT pointer_position{};
 POINT workspace_pointer_position{};
 POINT drag_last_position{};
 POINT force_drag_start_position{};
+HWND calculator_window = nullptr;
+HWND calculator_formula_combo = nullptr;
+HWND calculator_expression_edit = nullptr;
+HWND calculator_parameter_labels[3]{};
+HWND calculator_parameter_edits[3]{};
+HWND calculator_result_control = nullptr;
+HWND calculator_history_list = nullptr;
+HWND calculator_notes_edit = nullptr;
+HWND calculator_save_note_button = nullptr;
+HWND calculator_open_note_button = nullptr;
+HWND calculator_note_path_control = nullptr;
+std::wstring calculator_note_path;
+bool calculator_note_dirty = false;
 
 Vec3 operator+(Vec3 left, Vec3 right)
 {
@@ -668,8 +709,9 @@ int hovered_ui_target(const RECT& client_area, POINT position)
 {
     const WorkspacePage pages[]{
         WorkspacePage::objects, WorkspacePage::thermodynamics,
-        WorkspacePage::dynamics, WorkspacePage::quantum,
-        WorkspacePage::settings, WorkspacePage::experiments};
+        WorkspacePage::dynamics, WorkspacePage::model_info,
+        WorkspacePage::settings, WorkspacePage::experiments,
+        WorkspacePage::calculator};
     for (std::size_t index = 0; index < std::size(pages); ++index)
     {
         const RECT button = workspace_category_area(client_area, pages[index]);
@@ -786,9 +828,10 @@ const wchar_t* workspace_page_title(WorkspacePage page)
     case WorkspacePage::objects: return L"ОБЪЕКТЫ";
     case WorkspacePage::thermodynamics: return L"ТЕРМОДИНАМИКА";
     case WorkspacePage::dynamics: return L"ДИНАМИКА";
-    case WorkspacePage::quantum: return L"КВАНТОВАЯ ДИНАМИКА";
+    case WorkspacePage::model_info: return L"О МОДЕЛИ";
     case WorkspacePage::settings: return L"НАСТРОЙКИ";
     case WorkspacePage::experiments: return L"ЛАБОРАТОРИЯ";
+    case WorkspacePage::calculator: return L"КАЛЬКУЛЯТОР";
     default: return L"";
     }
 }
@@ -800,9 +843,10 @@ const wchar_t* workspace_page_hint(WorkspacePage page)
     case WorkspacePage::objects: return L"Молекулы и инструменты";
     case WorkspacePage::thermodynamics: return L"Состояние системы";
     case WorkspacePage::dynamics: return L"Параметры симуляции";
-    case WorkspacePage::quantum: return L"Квантовый модуль";
+    case WorkspacePage::model_info: return L"Точность и ограничения";
     case WorkspacePage::settings: return L"Оформление и окно";
     case WorkspacePage::experiments: return L"Инструменты опытов";
+    case WorkspacePage::calculator: return L"Высшая математика и физика";
     default: return L"";
     }
 }
@@ -818,12 +862,13 @@ void draw_workspace_rail(HDC context, const RECT& client_area)
         WorkspacePage::objects,
         WorkspacePage::thermodynamics,
         WorkspacePage::dynamics,
-        WorkspacePage::quantum,
+        WorkspacePage::model_info,
         WorkspacePage::settings,
-        WorkspacePage::experiments};
+        WorkspacePage::experiments,
+        WorkspacePage::calculator};
     const wchar_t* labels[]{
         L"Объекты", L"Термодинамика", L"Динамика",
-        L"Квантовая динамика", L"Настройки", L"Лаборатория"};
+        L"О модели", L"Настройки", L"Лаборатория", L"Калькулятор"};
     for (std::size_t index = 0; index < std::size(pages); ++index)
     {
         const RECT button = workspace_category_area(client_area, pages[index]);
@@ -2115,18 +2160,18 @@ void draw_tools_panel_overlay(HDC device_context, const RECT& client_area)
         }
         return;
     }
-    if (workspace_page == WorkspacePage::quantum)
+    if (workspace_page == WorkspacePage::model_info)
     {
         draw_icon(device_context,
             RECT{panel.left + 75, panel.top + 78,
                 panel.right - 75, panel.top + 128}, 3, x_axis_color);
-        draw_text(device_context, L"КВАНТОВЫЙ РЕЖИМ",
+        draw_text(device_context, L"КЛАССИЧЕСКАЯ МОДЕЛЬ",
             RECT{panel.left + 12, panel.top + 146,
                 panel.right - 12, panel.top + 170},
             primary_text_color, button_font, DT_CENTER);
-        draw_text(device_context, L"Раздел подготовлен для будущих "
-                L"инструментов. Классическая симуляция доступна в панели "
-                L"Динамика.",
+        draw_text(device_context, L"Безразмерная классическая динамика. "
+                L"Электронная структура, химические реакции и квантовые "
+                L"эффекты не моделируются. Параметры элементов эвристические.",
             RECT{panel.left + 16, panel.top + 184,
                 panel.right - 16, panel.top + 254},
             muted_text_color, small_font, DT_CENTER | DT_WORDBREAK);
@@ -2399,7 +2444,10 @@ void set_separate_interface_windows(HWND window, bool enabled);
 void show_detached_settings_window(HWND owner);
 void show_chart_window(HWND owner);
 void show_periodic_table(HWND owner);
+void show_calculator_window(HWND owner);
 void show_graphics_menu(HWND window, bool force_popup = false);
+void save_project_dialog(HWND owner);
+void open_project_dialog(HWND owner);
 
 void toggle_fullscreen(HWND window)
 {
@@ -2603,6 +2651,49 @@ bool ram_budget_allows_molecule(HWND window, std::size_t additional_count = 1)
     MessageBoxW(window,
         L"Adding the requested molecule(s) would exceed the configured RAM "
         L"budget. Increase the budget in OPT or remove molecules.",
+        L"Memory budget reached", MB_OK | MB_ICONWARNING);
+    return false;
+}
+
+bool ram_budget_allows_simulation_snapshot(HWND window)
+{
+    if (ram_budget_bytes == 0)
+    {
+        return true;
+    }
+    if (!update_process_memory_usage())
+    {
+        MessageBoxW(window,
+            L"Unable to estimate memory for the background simulation. "
+            L"Increase the RAM budget or disable it before continuing.",
+            L"Memory budget", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    const std::size_t particle_count =
+        simulation_engine.particles().size();
+    const std::size_t pair_count =
+        simulation_engine.metrics().neighbor_pairs;
+    const std::size_t estimated_neighbors = particle_count == 0
+        ? 16
+        : (std::max)(std::size_t{16},
+            (pair_count / particle_count) * 2 +
+                ((pair_count % particle_count) * 2) / particle_count);
+    constexpr long double estimated_particle_bytes = 1024.0L;
+    constexpr long double estimated_neighbor_pair_bytes = 16.0L;
+    const long double per_copy =
+        static_cast<long double>(particle_count) *
+        (estimated_particle_bytes +
+            static_cast<long double>(estimated_neighbors) *
+                estimated_neighbor_pair_bytes);
+    const long double projected_bytes =
+        static_cast<long double>(process_private_bytes) + 2.0L * per_copy;
+    if (projected_bytes <= static_cast<long double>(ram_budget_bytes))
+    {
+        return true;
+    }
+    MessageBoxW(window,
+        L"The configured RAM budget may not cover the background "
+        L"simulation snapshots. Increase the budget or remove molecules.",
         L"Memory budget reached", MB_OK | MB_ICONWARNING);
     return false;
 }
@@ -2841,6 +2932,14 @@ void show_graphics_menu(HWND window, bool force_popup)
             L"Bonderium", MB_OK | MB_ICONERROR);
         return;
     }
+    HMENU project_menu = CreatePopupMenu();
+    if (project_menu == nullptr)
+    {
+        DestroyMenu(menu);
+        MessageBoxW(window, L"Unable to open project actions.",
+            L"Bonderium", MB_OK | MB_ICONERROR);
+        return;
+    }
 
     UINT fullscreen_flags = MF_STRING;
     if (separate_interface_windows)
@@ -2880,7 +2979,16 @@ void show_graphics_menu(HWND window, bool force_popup)
                 ram_budget_bytes != 8ULL * 1024 * 1024 * 1024
             ? MF_CHECKED : 0);
 
-    const bool menu_ready =
+    const bool project_menu_ready =
+        AppendMenuW(project_menu, MF_STRING, menu_open_project,
+            L"Open project...") &&
+        AppendMenuW(project_menu, MF_STRING, menu_save_project,
+            L"Save project as...");
+    const bool project_menu_attached = project_menu_ready &&
+        AppendMenuW(menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(project_menu), L"Project");
+    const bool menu_ready = project_menu_attached &&
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
         AppendMenuW(menu, fullscreen_flags, menu_toggle_fullscreen,
             L"Fullscreen  (F11)") &&
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
@@ -2923,6 +3031,10 @@ void show_graphics_menu(HWND window, bool force_popup)
     if (!menu_ready)
     {
         DestroyMenu(menu);
+        if (!project_menu_attached)
+        {
+            DestroyMenu(project_menu);
+        }
         MessageBoxW(window, L"Unable to build the graphics settings menu.",
             L"Bonderium", MB_OK | MB_ICONERROR);
         return;
@@ -2952,6 +3064,12 @@ void show_graphics_menu(HWND window, bool force_popup)
         break;
     case menu_open_charts:
         show_chart_window(window);
+        break;
+    case menu_open_project:
+        open_project_dialog(window);
+        break;
+    case menu_save_project:
+        save_project_dialog(window);
         break;
     case menu_quality_performance:
         graphics_quality = GraphicsQuality::performance;
@@ -3190,14 +3308,20 @@ LRESULT CALLBACK detached_interface_procedure(
                 WorkspacePage::objects,
                 WorkspacePage::thermodynamics,
                 WorkspacePage::dynamics,
-                WorkspacePage::quantum,
+                WorkspacePage::model_info,
                 WorkspacePage::settings,
-                WorkspacePage::experiments};
+                WorkspacePage::experiments,
+                WorkspacePage::calculator};
             for (const WorkspacePage page : pages)
             {
                 const RECT category = workspace_category_area(client_area, page);
                 if (PtInRect(&category, position))
                 {
+                    if (page == WorkspacePage::calculator)
+                    {
+                        show_calculator_window(main_window);
+                        return 0;
+                    }
                     workspace_page = workspace_page == page
                         ? WorkspacePage::closed : page;
                     tools_panel_visible =
@@ -3730,8 +3854,8 @@ void show_help(HWND window)
         L"стены привязываются к целым значениям.\n"
         L"В 2D молекулы остаются в плоскости XY; переключатель размерности "
         L"находится в разделе Объекты.\n"
-        L"Раздел Квантовая динамика пока является заготовкой для будущих "
-        L"инструментов.\n"
+        L"Модель использует классическую динамику в приведённых единицах; "
+        L"квантовые эффекты и химические реакции не рассчитываются.\n"
         L"Сценарий проигрывается по времени симуляции и хранится до закрытия.\n"
         L"Крестик закрывает панель; клавиша F2 позволяет вернуть её.\n"
         L"Бюджет памяти предупреждает о достижении порога и приостанавливает "
@@ -3915,11 +4039,15 @@ void set_simulation_running(HWND window, bool running)
     if (!running)
     {
         stop_scenario(window);
+        if (simulation_worker_handle != nullptr)
+        {
+            simulation_worker_discard_result = true;
+        }
     }
     simulation_running = running;
     simulation_time_accumulator = 0.0;
     last_simulation_tick = GetTickCount64();
-    if (simulation_running)
+    if (simulation_running || simulation_worker_handle != nullptr)
     {
         SetTimer(window, simulation_timer_id,
             simulation_timer_interval_ms, nullptr);
@@ -3930,6 +4058,171 @@ void set_simulation_running(HWND window, bool running)
     }
 
     invalidate_simulation_ui(window, true);
+}
+
+void save_project_dialog(HWND owner)
+{
+    std::array<wchar_t, 32768> selected_path{};
+    constexpr wchar_t file_filter[] =
+        L"Bonderium project (*.bond)\0*.bond\0All files (*.*)\0*.*\0\0";
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = file_filter;
+    dialog.lpstrFile = selected_path.data();
+    dialog.nMaxFile = static_cast<DWORD>(selected_path.size());
+    dialog.lpstrDefExt = L"bond";
+    dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT |
+        OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&dialog))
+    {
+        const DWORD error = CommDlgExtendedError();
+        if (error != 0)
+        {
+            MessageBoxW(owner,
+                L"The project save dialog could not be opened.",
+                L"Save project", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    const std::filesystem::path destination(selected_path.data());
+    std::wstring temporary_name = destination.native() + L".tmp." +
+        std::to_wstring(GetCurrentProcessId()) + L"." +
+        std::to_wstring(GetTickCount64());
+    HANDLE temporary_handle = CreateFileW(temporary_name.c_str(),
+        GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (temporary_handle == INVALID_HANDLE_VALUE)
+    {
+        MessageBoxW(owner, L"Could not create a temporary project file.",
+            L"Save project", MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(temporary_handle);
+
+    std::string error;
+    bool saved = false;
+    {
+        std::ofstream output(std::filesystem::path(temporary_name),
+            std::ios::binary | std::ios::trunc);
+        if (output && project_file::save(output, simulation_engine, error))
+        {
+            output.close();
+            saved = static_cast<bool>(output);
+        }
+        else if (error.empty())
+        {
+            error = "Could not open the temporary project file for writing.";
+        }
+    }
+    if (!saved || !MoveFileExW(temporary_name.c_str(),
+            destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileW(temporary_name.c_str());
+        if (error.empty())
+        {
+            error = "Could not replace the selected project file.";
+        }
+        const std::wstring message(error.begin(), error.end());
+        MessageBoxW(owner, message.c_str(),
+            L"Save project failed", MB_OK | MB_ICONERROR);
+    }
+}
+
+void open_project_dialog(HWND owner)
+{
+    std::array<wchar_t, 32768> selected_path{};
+    constexpr wchar_t file_filter[] =
+        L"Bonderium project (*.bond)\0*.bond\0All files (*.*)\0*.*\0\0";
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = file_filter;
+    dialog.lpstrFile = selected_path.data();
+    dialog.nMaxFile = static_cast<DWORD>(selected_path.size());
+    dialog.lpstrDefExt = L"bond";
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+        OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog))
+    {
+        const DWORD error = CommDlgExtendedError();
+        if (error != 0)
+        {
+            MessageBoxW(owner,
+                L"The project open dialog could not be opened.",
+                L"Open project", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+
+    simulation::Engine loaded;
+    std::string error;
+    std::ifstream input(std::filesystem::path(selected_path.data()),
+        std::ios::binary);
+    if (!input || !project_file::load(input, loaded, error))
+    {
+        if (error.empty())
+        {
+            error = "Could not open the selected project file.";
+        }
+        const std::wstring message(error.begin(), error.end());
+        MessageBoxW(owner, message.c_str(),
+            L"Open project failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (MessageBoxW(owner,
+            L"Opening this project replaces the current system. Continue?",
+            L"Open project", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+    {
+        return;
+    }
+
+    set_simulation_running(owner, false);
+    simulation_engine = std::move(loaded);
+    scenario_steps.clear();
+    selected_particles.clear();
+    selected_molecule_id = 0;
+    pending_bond_molecule_id = 0;
+    molecule_tool_active = false;
+    bond_tool_active = false;
+    wall_tool_active = false;
+    wall_dragging = false;
+    lasso_dragging = false;
+    lasso_points.clear();
+    molecular_tool = MolecularTool::select;
+    chart_particle_indices.clear();
+    chart_samples.clear();
+    chart_next_sample = 0;
+    chart_sample_count = 0;
+    chart_last_recorded_step = 0;
+    chart_selection_initialized = false;
+    telemetry.simulation_sample_started_at = 0;
+    telemetry.last_simulation_step_sample = 0;
+    telemetry.simulation_steps_per_second = 0.0;
+    telemetry.simulation_step_time_ms = 0.0;
+    saved_3d_camera = false;
+    stop_camera_motion(owner);
+    if (simulation_engine.config().two_dimensional)
+    {
+        camera_state.target.z = 0.0;
+        camera_state.yaw = -pi / 2.0;
+        camera_state.pitch = 1.52;
+        molecule_placement_height = 0.0;
+    }
+    else
+    {
+        camera_state.yaw = -pi / 4.0;
+        camera_state.pitch = pi / 3.0;
+        molecule_placement_height =
+            element_display_radius(selected_element_number);
+    }
+    invalidate_simulation_ui(owner, true);
+    if (chart_window != nullptr)
+    {
+        InvalidateRect(chart_window, nullptr, FALSE);
+    }
 }
 
 Vec3 limit_interaction_force(Vec3 force)
@@ -4970,6 +5263,951 @@ bool parse_input_number(const wchar_t* text, double& value)
     wchar_t* end = nullptr;
     value = std::wcstod(text, &end);
     return end != text && *end == L'\0' && std::isfinite(value);
+}
+
+constexpr int calculator_formula_id = 2101;
+constexpr int calculator_expression_id = 2102;
+constexpr int calculator_parameter_id = 2110;
+constexpr int calculator_run_id = 2120;
+constexpr int calculator_insert_result_id = 2121;
+constexpr int calculator_open_note_id = 2122;
+constexpr int calculator_save_note_id = 2123;
+constexpr int calculator_result_id = 2124;
+constexpr int calculator_history_id = 2125;
+constexpr int calculator_notes_id = 2126;
+constexpr int calculator_note_path_id = 2127;
+constexpr std::size_t calculator_maximum_note_bytes = 4 * 1024 * 1024;
+WNDPROC calculator_edit_original_procedure = nullptr;
+HBRUSH calculator_control_background = nullptr;
+
+std::wstring control_text(HWND control)
+{
+    const int length = GetWindowTextLengthW(control);
+    if (length <= 0)
+    {
+        return {};
+    }
+    std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+    const int copied = GetWindowTextW(
+        control, text.data(), static_cast<int>(text.size()));
+    text.resize(static_cast<std::size_t>((std::max)(copied, 0)));
+    return text;
+}
+
+bool narrow_ascii_expression(const std::wstring& wide, std::string& expression)
+{
+    expression.clear();
+    expression.reserve(wide.size());
+    for (const wchar_t character : wide)
+    {
+        if (character < 0x20 || character > 0x7e)
+        {
+            return false;
+        }
+        expression.push_back(static_cast<char>(character));
+    }
+    return true;
+}
+
+bool parse_calculator_value(const wchar_t* text, double& value)
+{
+    if (parse_input_number(text, value))
+    {
+        return true;
+    }
+    std::string expression;
+    std::string error;
+    return narrow_ascii_expression(text, expression) &&
+        physics_calculator::evaluate(expression, value, error);
+}
+
+void set_calculator_title()
+{
+    if (calculator_window == nullptr)
+    {
+        return;
+    }
+    SetWindowTextW(calculator_window,
+        calculator_note_dirty
+            ? L"Bonderium — калькулятор и блокнот *"
+            : L"Bonderium — калькулятор и блокнот");
+}
+
+void set_calculator_mode(int mode)
+{
+    static const wchar_t* labels[6][3]{
+        {L"", L"", L""},
+        {L"Масса m (кг)", L"Скорость v (м/с)", L""},
+        {L"Масса m (кг)", L"Скорость v (м/с)", L""},
+        {L"Сила F (Н)", L"Масса m (кг)", L""},
+        {L"Заряд q₁ (Кл)", L"Заряд q₂ (Кл)", L"Расстояние r (м)"},
+        {L"Количество вещества n (моль)", L"Температура T (К)",
+            L"Объём V (м³)"}};
+    static const wchar_t* defaults[6][3]{
+        {L"", L"", L""},
+        {L"1", L"1", L""},
+        {L"1", L"1", L""},
+        {L"1", L"1", L""},
+        {L"1e-6", L"1e-6", L"1"},
+        {L"1", L"273.15", L"1"}};
+    const bool expression_mode = mode == 0 || mode >= 7;
+    const bool physical_formula = mode >= 1 && mode <= 6;
+    int parameter_count = 0;
+    if (physical_formula)
+    {
+        parameter_count = mode >= 4 ? 3 : 2;
+    }
+    else if (mode == 7)
+    {
+        parameter_count = 2;
+    }
+    else if (mode == 8)
+    {
+        parameter_count = 2;
+    }
+    ShowWindow(calculator_expression_edit,
+        expression_mode ? SW_SHOW : SW_HIDE);
+    for (int index = 0; index < 3; ++index)
+    {
+        const bool visible = index < parameter_count;
+        ShowWindow(calculator_parameter_labels[index],
+            visible ? SW_SHOW : SW_HIDE);
+        ShowWindow(calculator_parameter_edits[index],
+            visible ? SW_SHOW : SW_HIDE);
+        if (visible)
+        {
+            const wchar_t* label = L"";
+            const wchar_t* value = L"";
+            if (physical_formula)
+            {
+                const int formula_index = mode;
+                label = labels[formula_index - 1][index];
+                value = defaults[formula_index - 1][index];
+            }
+            else if (mode == 7)
+            {
+                label = index == 0 ? L"Точка x" : L"Шаг h > 0";
+                value = index == 0 ? L"1" : L"0.001";
+            }
+            else
+            {
+                label = index == 0 ? L"Нижний предел a" : L"Верхний предел b";
+                value = index == 0 ? L"0" : L"pi";
+            }
+            SetWindowTextW(calculator_parameter_labels[index], label);
+            SetWindowTextW(calculator_parameter_edits[index], value);
+        }
+    }
+    if (mode == 0)
+    {
+        SetWindowTextW(calculator_expression_edit,
+            L"sin(pi/4) + sqrt(2)");
+    }
+    else if (mode == 7 || mode == 8)
+    {
+        SetWindowTextW(calculator_expression_edit, L"sin(x)");
+    }
+    else
+    {
+        SetWindowTextW(calculator_expression_edit, L"");
+    }
+    if (calculator_window != nullptr)
+    {
+        SetFocus(expression_mode
+            ? calculator_expression_edit
+            : calculator_parameter_edits[0]);
+    }
+}
+
+void show_calculator_result(const std::wstring& message)
+{
+    SetWindowTextW(calculator_result_control, message.c_str());
+}
+
+void run_calculator(HWND window)
+{
+    const int mode = static_cast<int>(SendMessageW(
+        calculator_formula_combo, CB_GETCURSEL, 0, 0));
+    double result = 0.0;
+    std::string error;
+    bool succeeded = false;
+    std::wstring expression_text;
+    std::wstring result_label = L"Результат";
+    const wchar_t* unit = L"";
+    const std::wstring input_text = control_text(calculator_expression_edit);
+
+    if (mode == 0 || mode == 7 || mode == 8)
+    {
+        std::string expression;
+        if (!narrow_ascii_expression(input_text, expression))
+        {
+            show_calculator_result(
+                L"Ошибка: используйте ASCII-имена функций и десятичную точку.");
+            return;
+        }
+        if (mode == 0)
+        {
+            succeeded = physics_calculator::evaluate(
+                expression, result, error);
+        }
+        else if (mode == 7)
+        {
+            double x = 0.0;
+            double step = 0.0;
+            const std::wstring x_text =
+                control_text(calculator_parameter_edits[0]);
+            const std::wstring step_text =
+                control_text(calculator_parameter_edits[1]);
+            succeeded = parse_input_number(x_text.c_str(), x) &&
+                parse_input_number(step_text.c_str(), step) &&
+                physics_calculator::differentiate(
+                    expression, x, step, result, error);
+            result_label = L"Производная";
+        }
+        else
+        {
+            double start = 0.0;
+            double end = 0.0;
+            const std::wstring start_text =
+                control_text(calculator_parameter_edits[0]);
+            const std::wstring end_text =
+                control_text(calculator_parameter_edits[1]);
+            succeeded = parse_calculator_value(start_text.c_str(), start) &&
+                parse_calculator_value(end_text.c_str(), end) &&
+                physics_calculator::integrate(
+                    expression, start, end, 1000, result, error);
+            result_label = L"Интеграл (1000 интервалов Симпсона)";
+        }
+        expression_text = input_text;
+    }
+    else
+    {
+        std::array<double, 3> values{};
+        const std::size_t count = mode >= 4 ? 3 : 2;
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            const std::wstring value =
+                control_text(calculator_parameter_edits[index]);
+            if (!parse_input_number(value.c_str(), values[index]))
+            {
+                show_calculator_result(
+                    L"Ошибка: введите конечное число в каждое поле (точка для дроби).");
+                return;
+            }
+        }
+        physics_calculator::Formula formula{};
+        switch (mode)
+        {
+        case 1:
+            formula = physics_calculator::Formula::kinetic_energy;
+            result_label = L"Кинетическая энергия";
+            unit = L"Дж";
+            break;
+        case 2:
+            formula = physics_calculator::Formula::momentum;
+            result_label = L"Импульс";
+            unit = L"кг·м/с";
+            break;
+        case 3:
+            formula = physics_calculator::Formula::acceleration;
+            result_label = L"Ускорение";
+            unit = L"м/с²";
+            break;
+        case 4:
+            formula = physics_calculator::Formula::coulomb_potential;
+            result_label = L"Электростатическая потенциальная энергия";
+            unit = L"Дж";
+            break;
+        case 5:
+            formula = physics_calculator::Formula::coulomb_force;
+            result_label = L"Сила Кулона";
+            unit = L"Н";
+            break;
+        case 6:
+            formula = physics_calculator::Formula::ideal_gas_pressure;
+            result_label = L"Давление идеального газа";
+            unit = L"Па";
+            break;
+        default:
+            return;
+        }
+        succeeded = physics_calculator::calculate(
+            formula, values, result, error);
+    }
+
+    if (!succeeded)
+    {
+        std::wstring message = L"Ошибка: ";
+        if (error.empty())
+        {
+            message += L"проверьте значения и границы интегрирования.";
+        }
+        else
+        {
+            message.append(error.begin(), error.end());
+        }
+        show_calculator_result(message);
+        return;
+    }
+
+    wchar_t formatted[192]{};
+    std::swprintf(formatted, std::size(formatted), L"%s = %.12g %s",
+        result_label.c_str(), result, unit);
+    show_calculator_result(formatted);
+    std::wstring history = formatted;
+    if (!expression_text.empty())
+    {
+        history += L"  [";
+        history += expression_text;
+        history += L"]";
+    }
+    SendMessageW(calculator_history_list, LB_ADDSTRING, 0,
+        reinterpret_cast<LPARAM>(history.c_str()));
+    const LRESULT item_count =
+        SendMessageW(calculator_history_list, LB_GETCOUNT, 0, 0);
+    if (item_count > 100)
+    {
+        SendMessageW(calculator_history_list, LB_DELETESTRING, 0, 0);
+    }
+    const LRESULT current_count =
+        SendMessageW(calculator_history_list, LB_GETCOUNT, 0, 0);
+    SendMessageW(calculator_history_list, LB_SETTOPINDEX,
+        (std::max)(static_cast<LRESULT>(0), current_count - 1), 0);
+    SetFocus(window);
+}
+
+bool read_calculator_note(const std::wstring& path, std::wstring& text)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+    {
+        return false;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+    std::ifstream input(std::filesystem::path(path), std::ios::binary);
+    if (!input)
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+    input.seekg(0, std::ios::end);
+    const std::streamoff size = input.tellg();
+    if (size < 0 ||
+        static_cast<std::uint64_t>(size) > calculator_maximum_note_bytes)
+    {
+        SetLastError(ERROR_FILE_TOO_LARGE);
+        return false;
+    }
+    input.seekg(0, std::ios::beg);
+    std::vector<char> bytes(static_cast<std::size_t>(size));
+    if (!bytes.empty())
+    {
+        input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!input)
+        {
+            SetLastError(ERROR_READ_FAULT);
+            return false;
+        }
+    }
+    if (bytes.size() >= 2 &&
+        static_cast<unsigned char>(bytes[0]) == 0xff &&
+        static_cast<unsigned char>(bytes[1]) == 0xfe)
+    {
+        if ((bytes.size() - 2) % 2 != 0)
+        {
+            SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+            return false;
+        }
+        text.resize((bytes.size() - 2) / 2);
+        for (std::size_t index = 0; index < text.size(); ++index)
+        {
+            text[index] = static_cast<wchar_t>(
+                static_cast<unsigned char>(bytes[2 + index * 2]) |
+                (static_cast<unsigned char>(bytes[3 + index * 2]) << 8));
+        }
+    }
+    else
+    {
+        std::size_t offset =
+            bytes.size() >= 3 &&
+            static_cast<unsigned char>(bytes[0]) == 0xef &&
+            static_cast<unsigned char>(bytes[1]) == 0xbb &&
+            static_cast<unsigned char>(bytes[2]) == 0xbf
+                ? 3 : 0;
+        if (std::find(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                bytes.end(), '\0') != bytes.end())
+        {
+            SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+            return false;
+        }
+        const char* data = bytes.empty() ? "" : bytes.data() + offset;
+        const int length = static_cast<int>(bytes.size() - offset);
+        int wide_length = length == 0 ? 0
+            : MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                data, length, nullptr, 0);
+        UINT code_page = CP_UTF8;
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        if (wide_length == 0 && length != 0 && offset == 0)
+        {
+            code_page = CP_ACP;
+            flags = 0;
+            wide_length = MultiByteToWideChar(
+                code_page, flags, data, length, nullptr, 0);
+        }
+        if (wide_length == 0 && length != 0)
+        {
+            SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+            return false;
+        }
+        text.resize(static_cast<std::size_t>(wide_length));
+        if (wide_length != 0 &&
+            MultiByteToWideChar(code_page, flags, data, length,
+                text.data(), wide_length) != wide_length)
+        {
+            return false;
+        }
+    }
+    if (text.find(L'\0') != std::wstring::npos)
+    {
+        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return false;
+    }
+    return true;
+}
+
+bool save_calculator_note(HWND window)
+{
+    std::wstring path = calculator_note_path;
+    if (path.empty())
+    {
+        wchar_t filename[32768]{};
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = window;
+        dialog.lpstrFilter =
+            L"Текстовые файлы (*.txt)\0*.txt\0Все файлы (*.*)\0*.*\0\0";
+        dialog.lpstrFile = filename;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(filename));
+        dialog.lpstrDefExt = L"txt";
+        dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST |
+            OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+        if (!GetSaveFileNameW(&dialog))
+        {
+            if (CommDlgExtendedError() != 0)
+            {
+                MessageBoxW(window, L"Не удалось открыть диалог сохранения.",
+                    L"Блокнот", MB_OK | MB_ICONERROR);
+            }
+            return false;
+        }
+        path = filename;
+    }
+
+    const std::wstring text = control_text(calculator_notes_edit);
+    const int byte_count = text.empty() ? 0 : WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (byte_count == 0 && !text.empty())
+    {
+        MessageBoxW(window, L"Не удалось преобразовать заметку в UTF-8.",
+            L"Блокнот", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    if (static_cast<std::size_t>(byte_count) > calculator_maximum_note_bytes)
+    {
+        MessageBoxW(window, L"Заметка превышает ограничение в 4 МиБ.",
+            L"Блокнот", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    std::vector<char> bytes(static_cast<std::size_t>(byte_count));
+    if (byte_count != 0 &&
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+            static_cast<int>(text.size()), bytes.data(), byte_count,
+            nullptr, nullptr) != byte_count)
+    {
+        MessageBoxW(window, L"Не удалось преобразовать заметку в UTF-8.",
+            L"Блокнот", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    std::filesystem::path target(path);
+    std::filesystem::path temporary = target;
+    temporary += L".tmp-" + std::to_wstring(GetTickCount64());
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        const char bom[]{static_cast<char>(0xef),
+            static_cast<char>(0xbb), static_cast<char>(0xbf)};
+        if (output)
+        {
+            output.write(bom, sizeof(bom));
+            if (!bytes.empty())
+            {
+                output.write(bytes.data(),
+                    static_cast<std::streamsize>(bytes.size()));
+            }
+            output.flush();
+        }
+        if (!output)
+        {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            MessageBoxW(window, L"Не удалось записать файл заметок.",
+                L"Блокнот", MB_OK | MB_ICONERROR);
+            return false;
+        }
+    }
+    if (!MoveFileExW(temporary.c_str(), target.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        const DWORD error = GetLastError();
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        wchar_t message[160]{};
+        std::swprintf(message, std::size(message),
+            L"Не удалось сохранить заметку (ошибка Windows %lu).",
+            error);
+        MessageBoxW(window, message, L"Блокнот", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    calculator_note_path = path;
+    calculator_note_dirty = false;
+    SetWindowTextW(calculator_note_path_control, path.c_str());
+    set_calculator_title();
+    return true;
+}
+
+bool confirm_calculator_note_discard(HWND window)
+{
+    if (!calculator_note_dirty)
+    {
+        return true;
+    }
+    const int answer = MessageBoxW(window,
+        L"Заметка изменена. Сохранить изменения перед продолжением?",
+        L"Несохранённая заметка", MB_YESNOCANCEL | MB_ICONWARNING);
+    if (answer == IDCANCEL)
+    {
+        return false;
+    }
+    return answer != IDYES || save_calculator_note(window);
+}
+
+void open_calculator_note(HWND window)
+{
+    wchar_t filename[32768]{};
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = window;
+    dialog.lpstrFilter =
+        L"Текстовые файлы (*.txt)\0*.txt\0Все файлы (*.*)\0*.*\0\0";
+    dialog.lpstrFile = filename;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(filename));
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST |
+        OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog))
+    {
+        if (CommDlgExtendedError() != 0)
+        {
+            MessageBoxW(window, L"Не удалось открыть диалог выбора файла.",
+                L"Блокнот", MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+    if (!confirm_calculator_note_discard(window))
+    {
+        return;
+    }
+    std::wstring text;
+    if (!read_calculator_note(filename, text))
+    {
+        const DWORD error = GetLastError();
+        wchar_t message[192]{};
+        std::swprintf(message, std::size(message),
+            L"Не удалось прочитать файл заметок (ошибка Windows %lu).",
+            error);
+        MessageBoxW(window, message, L"Блокнот", MB_OK | MB_ICONERROR);
+        return;
+    }
+    SetWindowTextW(calculator_notes_edit, text.c_str());
+    calculator_note_path = filename;
+    calculator_note_dirty = false;
+    SetWindowTextW(calculator_note_path_control, filename);
+    set_calculator_title();
+}
+
+LRESULT CALLBACK calculator_edit_procedure(
+    HWND control, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    if (message == WM_KEYDOWN && w_param == VK_RETURN)
+    {
+        HWND parent = GetParent(control);
+        SendMessageW(parent, WM_COMMAND,
+            MAKEWPARAM(calculator_run_id, BN_CLICKED),
+            reinterpret_cast<LPARAM>(GetDlgItem(parent, calculator_run_id)));
+        return 0;
+    }
+    return CallWindowProcW(calculator_edit_original_procedure,
+        control, message, w_param, l_param);
+}
+
+LRESULT CALLBACK calculator_window_procedure(
+    HWND window, UINT message, WPARAM w_param, LPARAM l_param)
+{
+    if (message == WM_ERASEBKGND)
+    {
+        return 1;
+    }
+    if (message == WM_CREATE)
+    {
+        calculator_control_background = CreateSolidBrush(surface_color);
+        calculator_formula_combo = CreateWindowExW(WS_EX_CLIENTEDGE,
+            L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                CBS_DROPDOWNLIST,
+            0, 0, 0, 240, window,
+            reinterpret_cast<HMENU>(calculator_formula_id),
+            GetModuleHandleW(nullptr), nullptr);
+        calculator_expression_edit = CreateWindowExW(WS_EX_CLIENTEDGE,
+            L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            0, 0, 0, 28, window,
+            reinterpret_cast<HMENU>(calculator_expression_id),
+            GetModuleHandleW(nullptr), nullptr);
+        for (int index = 0; index < 3; ++index)
+        {
+            calculator_parameter_labels[index] = CreateWindowExW(0,
+                L"STATIC", L"", WS_CHILD | SS_LEFT,
+                0, 0, 0, 24, window, nullptr,
+                GetModuleHandleW(nullptr), nullptr);
+            calculator_parameter_edits[index] = CreateWindowExW(
+                WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 28, window,
+                reinterpret_cast<HMENU>(
+                    calculator_parameter_id + index),
+                GetModuleHandleW(nullptr), nullptr);
+        }
+        const auto create_button = [window](const wchar_t* title, int id)
+        {
+            return CreateWindowExW(0, L"BUTTON", title,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0, 0, 0, 32, window, reinterpret_cast<HMENU>(id),
+                GetModuleHandleW(nullptr), nullptr);
+        };
+        HWND run_button = create_button(L"Вычислить", calculator_run_id);
+        HWND insert_button = create_button(
+            L"Вставить результат в заметку", calculator_insert_result_id);
+        calculator_open_note_button =
+            create_button(L"Открыть", calculator_open_note_id);
+        calculator_save_note_button =
+            create_button(L"Сохранить", calculator_save_note_id);
+        calculator_result_control = CreateWindowExW(WS_EX_CLIENTEDGE,
+            L"STATIC", L"Введите выражение или выберите формулу.",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            0, 0, 0, 54, window,
+            reinterpret_cast<HMENU>(calculator_result_id),
+            GetModuleHandleW(nullptr), nullptr);
+        calculator_history_list = CreateWindowExW(WS_EX_CLIENTEDGE,
+            L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
+            0, 0, 0, 100, window,
+            reinterpret_cast<HMENU>(calculator_history_id),
+            GetModuleHandleW(nullptr), nullptr);
+        calculator_notes_edit = CreateWindowExW(WS_EX_CLIENTEDGE,
+            L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_MULTILINE |
+                ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+            0, 0, 0, 100, window,
+            reinterpret_cast<HMENU>(calculator_notes_id),
+            GetModuleHandleW(nullptr), nullptr);
+        calculator_note_path_control = CreateWindowExW(0, L"STATIC",
+            L"Новая заметка", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            0, 0, 0, 22, window,
+            reinterpret_cast<HMENU>(calculator_note_path_id),
+            GetModuleHandleW(nullptr), nullptr);
+        HWND controls[]{
+            calculator_formula_combo, calculator_expression_edit,
+            calculator_parameter_labels[0], calculator_parameter_labels[1],
+            calculator_parameter_labels[2], calculator_parameter_edits[0],
+            calculator_parameter_edits[1], calculator_parameter_edits[2],
+            run_button, insert_button, calculator_open_note_button,
+            calculator_save_note_button, calculator_result_control,
+            calculator_history_list, calculator_notes_edit,
+            calculator_note_path_control};
+        if (calculator_control_background == nullptr ||
+            std::find(std::begin(controls), std::end(controls), nullptr) !=
+                std::end(controls))
+        {
+            MessageBoxW(window, L"Не удалось создать элементы калькулятора.",
+                L"Калькулятор", MB_OK | MB_ICONERROR);
+            return -1;
+        }
+        SendMessageW(calculator_formula_combo, WM_SETFONT,
+            reinterpret_cast<WPARAM>(small_font), TRUE);
+        SendMessageW(calculator_notes_edit, EM_SETLIMITTEXT,
+            static_cast<WPARAM>(calculator_maximum_note_bytes), 0);
+        for (HWND control : controls)
+        {
+            SendMessageW(control, WM_SETFONT,
+                reinterpret_cast<WPARAM>(small_font), TRUE);
+        }
+        const wchar_t* modes[]{
+            L"Научный калькулятор",
+            L"Кинетическая энергия  E = mv²/2",
+            L"Импульс  p = mv",
+            L"Второй закон Ньютона  a = F/m",
+            L"Потенциальная энергия Кулона",
+            L"Сила Кулона",
+            L"Идеальный газ  p = nRT/V",
+            L"Численная производная f'(x)",
+            L"Определённый интеграл Симпсона"};
+        for (const wchar_t* mode : modes)
+        {
+            SendMessageW(calculator_formula_combo, CB_ADDSTRING,
+                0, reinterpret_cast<LPARAM>(mode));
+        }
+        SendMessageW(calculator_formula_combo, CB_SETCURSEL, 0, 0);
+        calculator_edit_original_procedure =
+            reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+                calculator_expression_edit, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(calculator_edit_procedure)));
+        for (HWND edit : calculator_parameter_edits)
+        {
+            SetWindowLongPtrW(edit, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(calculator_edit_procedure));
+        }
+        SetWindowTextW(calculator_expression_edit,
+            L"sin(pi/4) + sqrt(2)");
+        set_calculator_mode(0);
+        return 0;
+    }
+    if (message == WM_CTLCOLORSTATIC || message == WM_CTLCOLOREDIT ||
+        message == WM_CTLCOLORLISTBOX)
+    {
+        HDC context = reinterpret_cast<HDC>(w_param);
+        SetTextColor(context, primary_text_color);
+        SetBkColor(context, surface_color);
+        return reinterpret_cast<LRESULT>(calculator_control_background);
+    }
+    if (message == WM_SIZE)
+    {
+        const int width = LOWORD(l_param);
+        const int height = HIWORD(l_param);
+        const int split = (std::max)(470, (width - 72) / 2);
+        const int right_left = split + 36;
+        const int right_width = (std::max)(320, width - right_left - 28);
+        MoveWindow(calculator_formula_combo, 28, 72, split - 28, 260, TRUE);
+        MoveWindow(calculator_expression_edit, 28, 132, split - 28, 32, TRUE);
+        for (int index = 0; index < 3; ++index)
+        {
+            const int top = 184 + index * 52;
+            MoveWindow(calculator_parameter_labels[index],
+                28, top, split - 230, 28, TRUE);
+            MoveWindow(calculator_parameter_edits[index],
+                split - 190, top - 4, 162, 30, TRUE);
+        }
+        MoveWindow(GetDlgItem(window, calculator_run_id),
+            28, 350, 142, 36, TRUE);
+        MoveWindow(GetDlgItem(window, calculator_insert_result_id),
+            180, 350, split - 208, 36, TRUE);
+        MoveWindow(calculator_result_control,
+            28, 402, split - 28, 56, TRUE);
+        MoveWindow(calculator_history_list, 28, 470,
+            split - 28, (std::max)(80, height - 494), TRUE);
+        MoveWindow(calculator_open_note_button,
+            right_left, 72, 108, 34, TRUE);
+        MoveWindow(calculator_save_note_button,
+            right_left + 118, 72, 108, 34, TRUE);
+        MoveWindow(calculator_note_path_control,
+            right_left, 111, right_width, 24, TRUE);
+        MoveWindow(calculator_notes_edit,
+            right_left, 142, right_width, (std::max)(120, height - 166), TRUE);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    if (message == WM_GETMINMAXINFO)
+    {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
+        limits->ptMinTrackSize.x = 1050;
+        limits->ptMinTrackSize.y = 680;
+        return 0;
+    }
+    if (message == WM_COMMAND)
+    {
+        const int control_id = LOWORD(w_param);
+        if (control_id == calculator_formula_id &&
+            HIWORD(w_param) == CBN_SELCHANGE)
+        {
+            set_calculator_mode(static_cast<int>(SendMessageW(
+                calculator_formula_combo, CB_GETCURSEL, 0, 0)));
+            return 0;
+        }
+        if (control_id == calculator_notes_id &&
+            HIWORD(w_param) == EN_CHANGE)
+        {
+            calculator_note_dirty = true;
+            set_calculator_title();
+            return 0;
+        }
+        if (control_id == calculator_run_id)
+        {
+            run_calculator(window);
+            return 0;
+        }
+        if (control_id == calculator_insert_result_id)
+        {
+            const std::wstring result = control_text(calculator_result_control);
+            if (!result.empty())
+            {
+                SendMessageW(calculator_notes_edit, EM_SETSEL,
+                    static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+                const std::wstring addition =
+                    (control_text(calculator_notes_edit).empty()
+                        ? L"" : L"\r\n") + result + L"\r\n";
+                SendMessageW(calculator_notes_edit, EM_REPLACESEL, TRUE,
+                    reinterpret_cast<LPARAM>(addition.c_str()));
+                SetFocus(calculator_notes_edit);
+            }
+            return 0;
+        }
+        if (control_id == calculator_open_note_id)
+        {
+            open_calculator_note(window);
+            return 0;
+        }
+        if (control_id == calculator_save_note_id)
+        {
+            save_calculator_note(window);
+            return 0;
+        }
+        if (control_id == calculator_history_id &&
+            HIWORD(w_param) == LBN_DBLCLK)
+        {
+            const LRESULT selection = SendMessageW(
+                calculator_history_list, LB_GETCURSEL, 0, 0);
+            if (selection != LB_ERR)
+            {
+                const LRESULT length = SendMessageW(
+                    calculator_history_list, LB_GETTEXTLEN, selection, 0);
+                std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+                SendMessageW(calculator_history_list, LB_GETTEXT,
+                    selection, reinterpret_cast<LPARAM>(text.data()));
+                text.resize(static_cast<std::size_t>(length));
+                SendMessageW(calculator_notes_edit, EM_SETSEL,
+                    static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+                SendMessageW(calculator_notes_edit, EM_REPLACESEL, TRUE,
+                    reinterpret_cast<LPARAM>(text.c_str()));
+            }
+            return 0;
+        }
+    }
+    if (message == WM_CLOSE)
+    {
+        if (confirm_calculator_note_discard(window))
+        {
+            DestroyWindow(window);
+        }
+        return 0;
+    }
+    if (message == WM_DESTROY)
+    {
+        if (calculator_window == window)
+        {
+            calculator_window = nullptr;
+            calculator_formula_combo = nullptr;
+            calculator_expression_edit = nullptr;
+            std::fill(std::begin(calculator_parameter_labels),
+                std::end(calculator_parameter_labels), nullptr);
+            std::fill(std::begin(calculator_parameter_edits),
+                std::end(calculator_parameter_edits), nullptr);
+            calculator_result_control = nullptr;
+            calculator_history_list = nullptr;
+            calculator_notes_edit = nullptr;
+            calculator_save_note_button = nullptr;
+            calculator_open_note_button = nullptr;
+            calculator_note_path_control = nullptr;
+            calculator_note_path.clear();
+            calculator_note_dirty = false;
+            calculator_edit_original_procedure = nullptr;
+        }
+        if (calculator_control_background != nullptr)
+        {
+            DeleteObject(calculator_control_background);
+            calculator_control_background = nullptr;
+        }
+        return 0;
+    }
+    if (message == WM_PAINT)
+    {
+        PAINTSTRUCT paint{};
+        HDC context = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        fill_rectangle(context, client, canvas_color);
+        const int split = (std::max)(
+            470, (static_cast<int>(client.right) - 72) / 2);
+        draw_text(context, L"ФИЗИКА И ВЫСШАЯ МАТЕМАТИКА",
+            RECT{28, 24, split, 56}, primary_text_color, button_font);
+        draw_text(context, L"БЛОКНОТ",
+            RECT{split + 36, 24, client.right - 28, 56},
+            primary_text_color, button_font);
+        draw_text(context, L"Формула или операция",
+            RECT{28, 52, split, 70}, muted_text_color, small_font);
+        draw_text(context, L"Выражение или функция f(x)",
+            RECT{28, 108, split, 128}, muted_text_color, small_font);
+        draw_text(context, L"Параметры",
+            RECT{28, 162, split, 182}, muted_text_color, small_font);
+        draw_text(context, L"История вычислений · двойной щелчок вставляет строку в заметку",
+            RECT{28, 462, split, 484}, muted_text_color, small_font);
+        draw_line(context, split + 18, 24, split + 18, client.bottom - 24,
+            border_color);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    return DefWindowProcW(window, message, w_param, l_param);
+}
+
+void show_calculator_window(HWND owner)
+{
+    if (calculator_window != nullptr)
+    {
+        ShowWindow(calculator_window, SW_SHOW);
+        SetForegroundWindow(calculator_window);
+        return;
+    }
+    static bool class_registered = false;
+    if (!class_registered)
+    {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.lpfnWndProc = calculator_window_procedure;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        window_class.hbrBackground = nullptr;
+        window_class.lpszClassName = calculator_window_class_name;
+        if (RegisterClassExW(&window_class) == 0 &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            MessageBoxW(owner, L"Не удалось зарегистрировать окно калькулятора.",
+                L"Калькулятор", MB_OK | MB_ICONERROR);
+            return;
+        }
+        class_registered = true;
+    }
+    RECT owner_rect{};
+    GetWindowRect(owner, &owner_rect);
+    calculator_window = CreateWindowExW(WS_EX_TOOLWINDOW,
+        calculator_window_class_name,
+        L"Bonderium — калькулятор и блокнот", WS_OVERLAPPEDWINDOW,
+        owner_rect.left + 40, owner_rect.top + 40, 1240, 820,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (calculator_window == nullptr)
+    {
+        MessageBoxW(owner, L"Не удалось открыть окно калькулятора.",
+            L"Калькулятор", MB_OK | MB_ICONERROR);
+        return;
+    }
+    ShowWindow(calculator_window, SW_SHOW);
+    UpdateWindow(calculator_window);
 }
 
 bool point_in_lasso(POINT point)
@@ -6020,6 +7258,41 @@ bool place_square_lattice(HWND window)
         square_lattice_start, square_lattice_end);
 }
 
+DWORD WINAPI simulation_step_worker(void* parameter)
+{
+    auto* context = static_cast<SimulationWorkerContext*>(parameter);
+    const auto started_at = std::chrono::steady_clock::now();
+    try
+    {
+        context->succeeded = context->engine->step(context->error);
+    }
+    catch (const std::exception& exception)
+    {
+        try
+        {
+            context->error = exception.what();
+        }
+        catch (...)
+        {
+        }
+    }
+    catch (...)
+    {
+        try
+        {
+            context->error =
+                "Unknown error while calculating a simulation step.";
+        }
+        catch (...)
+        {
+        }
+    }
+    context->elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started_at).count();
+    context->finished.store(true, std::memory_order_release);
+    return 0;
+}
+
 void update_simulation(HWND window)
 {
     const ULONGLONG now = GetTickCount64();
@@ -6027,59 +7300,160 @@ void update_simulation(HWND window)
         static_cast<double>(now - last_simulation_tick) / 1000.0);
     last_simulation_tick = now;
     const double time_step = simulation_engine.config().time_step;
-    const unsigned int maximum_steps_this_tick =
-        static_cast<unsigned int>(std::ceil(
-            maximum_catch_up_steps * time_flow_factor));
-    simulation_time_accumulator = (std::min)(
-        simulation_time_accumulator + elapsed * time_flow_factor,
-        time_step * maximum_steps_this_tick);
+    if (simulation_running)
+    {
+        const unsigned int maximum_steps_this_tick =
+            static_cast<unsigned int>(std::ceil(
+                maximum_catch_up_steps * time_flow_factor));
+        simulation_time_accumulator = (std::min)(
+            simulation_time_accumulator + elapsed * time_flow_factor,
+            time_step * maximum_steps_this_tick);
+    }
+    else
+    {
+        simulation_time_accumulator = 0.0;
+    }
 
-    unsigned int completed_steps = 0;
-    std::string error;
-    LARGE_INTEGER work_started_at{};
-    QueryPerformanceCounter(&work_started_at);
+    if (simulation_worker_handle != nullptr)
+    {
+        const DWORD wait_result =
+            WaitForSingleObject(simulation_worker_handle, 0);
+        if (wait_result == WAIT_TIMEOUT)
+        {
+            RECT client_area{};
+            GetClientRect(window, &client_area);
+            const RECT area = scene_area(client_area);
+            InvalidateRect(window, &area, FALSE);
+            return;
+        }
+        if (wait_result != WAIT_OBJECT_0)
+        {
+            set_simulation_running(window, false);
+            KillTimer(window, simulation_timer_id);
+            MessageBoxW(window,
+                L"The background simulation worker could not be collected.",
+                L"Simulation error", MB_OK | MB_ICONERROR);
+            return;
+        }
+
+        CloseHandle(simulation_worker_handle);
+        simulation_worker_handle = nullptr;
+        SimulationWorkerContext* context = simulation_worker_context;
+        simulation_worker_context = nullptr;
+        if (context == nullptr)
+        {
+            simulation_worker_baseline.reset();
+            simulation_worker_discard_result = false;
+            set_simulation_running(window, false);
+            MessageBoxW(window,
+                L"The background simulation worker returned no result.",
+                L"Simulation error", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (!context->finished.load(std::memory_order_acquire))
+        {
+            context->succeeded = false;
+            context->error.clear();
+        }
+        const bool may_apply_result = simulation_running &&
+            !simulation_worker_discard_result &&
+            simulation_worker_baseline != nullptr &&
+            simulation_engine.matches_state(*simulation_worker_baseline);
+        simulation_worker_discard_result = false;
+        if (context->succeeded && may_apply_result)
+        {
+            simulation_engine = std::move(*context->engine);
+            telemetry.simulation_step_time_ms +=
+                (context->elapsed_ms - telemetry.simulation_step_time_ms) *
+                0.15;
+            simulation_time_accumulator = (std::max)(
+                0.0, simulation_time_accumulator - time_step);
+            record_chart_sample();
+        }
+        else if (!context->succeeded)
+        {
+            set_simulation_running(window, false);
+            const std::string error = context->error.empty()
+                ? "The background simulation step failed."
+                : context->error;
+            const std::wstring message(error.begin(), error.end());
+            MessageBoxW(window, message.c_str(),
+                L"Simulation stopped — invalid state",
+                MB_OK | MB_ICONERROR);
+        }
+        delete context;
+        simulation_worker_baseline.reset();
+    }
+
+    if (!simulation_running)
+    {
+        if (simulation_worker_handle == nullptr)
+        {
+            KillTimer(window, simulation_timer_id);
+        }
+        return;
+    }
     if (molecule_dragging && !update_interaction_force(window))
     {
         set_simulation_running(window, false);
         return;
     }
-    while (simulation_time_accumulator >= time_step &&
-        completed_steps < maximum_steps_this_tick)
+    if (simulation_time_accumulator >= time_step)
     {
         update_scenario(window, time_step);
-        LARGE_INTEGER step_started_at{};
-        LARGE_INTEGER step_finished_at{};
-        QueryPerformanceCounter(&step_started_at);
-        if (!simulation_engine.step(error))
+        if (!ram_budget_allows_simulation_snapshot(window))
         {
             set_simulation_running(window, false);
-            const std::wstring message(error.begin(), error.end());
-            MessageBoxW(window, message.c_str(),
-                L"Simulation stopped — invalid state",
-                MB_OK | MB_ICONERROR);
             return;
         }
-        QueryPerformanceCounter(&step_finished_at);
-        const double step_time_ms = performance_frequency.QuadPart == 0
-            ? 0.0
-            : static_cast<double>(step_finished_at.QuadPart -
-                step_started_at.QuadPart) * 1000.0 /
-                static_cast<double>(performance_frequency.QuadPart);
-        telemetry.simulation_step_time_ms +=
-            (step_time_ms - telemetry.simulation_step_time_ms) * 0.15;
-        simulation_time_accumulator -= time_step;
-        ++completed_steps;
-        record_chart_sample();
-        LARGE_INTEGER work_finished_at{};
-        QueryPerformanceCounter(&work_finished_at);
-        const double work_time_ms = performance_frequency.QuadPart == 0
-            ? 0.0
-            : static_cast<double>(work_finished_at.QuadPart -
-                work_started_at.QuadPart) * 1000.0 /
-                static_cast<double>(performance_frequency.QuadPart);
-        if (work_time_ms >= simulation_work_budget_ms)
+        auto* context = new (std::nothrow) SimulationWorkerContext;
+        if (context == nullptr)
         {
-            break;
+            set_simulation_running(window, false);
+            MessageBoxW(window,
+                L"Not enough memory to start the simulation worker.",
+                L"Simulation error", MB_OK | MB_ICONERROR);
+            return;
+        }
+        try
+        {
+            simulation_worker_baseline =
+                std::make_unique<simulation::Engine>(simulation_engine);
+            context->engine =
+                std::make_unique<simulation::Engine>(*simulation_worker_baseline);
+        }
+        catch (const std::exception& exception)
+        {
+            delete context;
+            simulation_worker_baseline.reset();
+            set_simulation_running(window, false);
+            const std::wstring message(exception.what(),
+                exception.what() + std::char_traits<char>::length(
+                    exception.what()));
+            MessageBoxW(window, message.c_str(),
+                L"Simulation error", MB_OK | MB_ICONERROR);
+            return;
+        }
+
+        simulation_worker_context = context;
+        simulation_worker_discard_result = false;
+        simulation_worker_handle = CreateThread(nullptr, 0,
+            simulation_step_worker, context, 0, nullptr);
+        if (simulation_worker_handle == nullptr)
+        {
+            const DWORD error = GetLastError();
+            simulation_worker_context = nullptr;
+            delete context;
+            simulation_worker_baseline.reset();
+            simulation_worker_discard_result = false;
+            set_simulation_running(window, false);
+            wchar_t message[128]{};
+            std::swprintf(message, std::size(message),
+                L"Could not start the simulation worker (Windows error %lu).",
+                static_cast<unsigned long>(error));
+            MessageBoxW(window, message, L"Simulation error",
+                MB_OK | MB_ICONERROR);
+            return;
         }
     }
 
@@ -7153,15 +8527,21 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
                 WorkspacePage::objects,
                 WorkspacePage::thermodynamics,
                 WorkspacePage::dynamics,
-                WorkspacePage::quantum,
+                WorkspacePage::model_info,
                 WorkspacePage::settings,
-                WorkspacePage::experiments};
+                WorkspacePage::experiments,
+                WorkspacePage::calculator};
             for (const WorkspacePage page : pages)
             {
                 const RECT category =
                     workspace_category_area(client_area, page);
                 if (PtInRect(&category, position))
                 {
+                    if (page == WorkspacePage::calculator)
+                    {
+                        show_calculator_window(window);
+                        return 0;
+                    }
                     workspace_page = workspace_page == page
                         ? WorkspacePage::closed : page;
                     tools_panel_visible =
@@ -7691,6 +9071,21 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         return 0;
     }
 
+    if (message == WM_CLOSE)
+    {
+        if (calculator_window != nullptr &&
+            !confirm_calculator_note_discard(calculator_window))
+        {
+            return 0;
+        }
+        if (calculator_window != nullptr)
+        {
+            DestroyWindow(calculator_window);
+        }
+        DestroyWindow(window);
+        return 0;
+    }
+
     if (message == WM_DESTROY)
     {
         separate_interface_windows = false;
@@ -7707,6 +9102,18 @@ LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM w_param, LPA
         KillTimer(window, camera_timer_id);
         KillTimer(window, telemetry_timer_id);
         KillTimer(window, simulation_timer_id);
+        if (simulation_worker_handle != nullptr)
+        {
+            if (WaitForSingleObject(simulation_worker_handle, INFINITE) ==
+                WAIT_OBJECT_0)
+            {
+                CloseHandle(simulation_worker_handle);
+                delete simulation_worker_context;
+            }
+            simulation_worker_handle = nullptr;
+            simulation_worker_context = nullptr;
+            simulation_worker_baseline.reset();
+        }
         if (open_gl_context != nullptr)
         {
             if (wglMakeCurrent(window_device_context, open_gl_context))
