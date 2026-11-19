@@ -19,10 +19,14 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".Substring(1)
-          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Release tag must use vX.Y.Z format." }
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Release tag must use vX.Y.Z or vX.Y.Z-prerelease format."
+          }
           cmake -S . -B build -A x64 "-DBONDERIUM_VERSION=$version" -DBONDERIUM_ENABLE_UPDATES=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package application
@@ -37,5 +41,12 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          generate_release_notes: false
           files: Bonderium-windows-x64.zip
+          name: Bonderium ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            - Улучшены подсказки к элементам интерфейса.
+            - Добавлены русский и английский языки интерфейса.
+            - Добавлены отмена последнего действия и примеры молекул H₂O и кристалла NaCl.
+            - Обучение первого запуска удалено; для пустой сцены оставлена подсказка создания атома.
